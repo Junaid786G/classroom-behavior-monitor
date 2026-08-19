@@ -1,0 +1,238 @@
+# Classroom CCTV Monitor – Docker Compose
+#
+# Services
+# ────────
+#   postgres       PostgreSQL 16 + pgvector extension
+#   redis          Redis 7  (Celery broker + result backend)
+#   backend        FastAPI + Uvicorn  (port 8000)
+#   celery_worker  Celery worker for async video processing
+#   flower         Celery task monitor  (port 5555)  [opt-in profile]
+#   frontend       Streamlit dashboard  (port 8501)
+#
+# GPU support
+# ───────────
+#   1. Install nvidia-container-toolkit on the host.
+#   2. Uncomment the `deploy:` blocks under backend / celery_worker.
+#   3. Swap onnxruntime → onnxruntime-gpu and faiss-cpu → faiss-gpu
+#      in requirements.txt, then rebuild:
+#        docker compose build backend celery_worker
+#
+# Quick start (CPU)
+# ─────────────────
+#   docker compose up -d postgres redis
+#   docker compose run --rm backend python scripts/01_setup_db.py
+#   docker compose run --rm backend python scripts/02_register_students.py
+#   docker compose up -d
+#
+# Monitoring profile (optional Flower UI)
+#   docker compose --profile monitoring up -d
+
+services:
+
+  # ── PostgreSQL 16 + pgvector ──────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: cm_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-classroom_monitor}
+      POSTGRES_USER:     ${POSTGRES_USER:-cm_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cm_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cm_user} -d ${POSTGRES_DB:-classroom_monitor}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - cctv_net
+
+  # ── Redis 7 ───────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: cm_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+        --appendonly yes
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - cctv_net
+
+  # ── FastAPI backend ───────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: cm_backend:latest
+    container_name: cm_backend
+    restart: unless-stopped
+    command: >
+      uvicorn backend.main:app
+        --host 0.0.0.0
+        --port 8000
+        --workers 1
+        --loop asyncio
+        --log-level info
+    environment:
+      DATABASE_URL:            postgresql+asyncpg://${POSTGRES_USER:-cm_user}:${POSTGRES_PASSWORD:-cm_password}@postgres:5432/${POSTGRES_DB:-classroom_monitor}
+      REDIS_URL:               redis://redis:6379/0
+      CELERY_BROKER_URL:       redis://redis:6379/1
+      CELERY_RESULT_BACKEND:   redis://redis:6379/2
+      SECRET_KEY:              ${SECRET_KEY:-change_me_in_production_32chars}
+      ALGORITHM:               ${ALGORITHM:-HS256}
+      STORAGE_PATH:            /app/data
+      LOGS_PATH:               /app/logs
+      INSIGHTFACE_MODEL_NAME:  ${INSIGHTFACE_MODEL_NAME:-buffalo_l}
+      GALLERY_REBUILD_ON_STARTUP: ${GALLERY_REBUILD_ON_STARTUP:-false}
+      CORS_ORIGINS:            '["http://localhost:8501","http://frontend:8501"]'
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - insightface_cache:/root/.insightface
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s        # InsightFace model loading can be slow on first start
+    networks:
+      - cctv_net
+    # ── GPU support (uncomment for NVIDIA) ───────────────────────────────
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ── Celery worker – async video processing ───────────────────────────────
+  celery_worker:
+    image: cm_backend:latest
+    container_name: cm_celery
+    restart: unless-stopped
+    command: >
+      celery -A backend.tasks worker
+        --loglevel=info
+        --concurrency=2
+        --queues=video_processing,default
+        --hostname=worker@%h
+    environment:
+      DATABASE_URL:           postgresql+asyncpg://${POSTGRES_USER:-cm_user}:${POSTGRES_PASSWORD:-cm_password}@postgres:5432/${POSTGRES_DB:-classroom_monitor}
+      REDIS_URL:              redis://redis:6379/0
+      CELERY_BROKER_URL:      redis://redis:6379/1
+      CELERY_RESULT_BACKEND:  redis://redis:6379/2
+      SECRET_KEY:             ${SECRET_KEY:-change_me_in_production_32chars}
+      STORAGE_PATH:           /app/data
+      LOGS_PATH:              /app/logs
+      INSIGHTFACE_MODEL_NAME: ${INSIGHTFACE_MODEL_NAME:-buffalo_l}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - insightface_cache:/root/.insightface
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - cctv_net
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ── Celery Flower – task monitoring UI (opt-in) ───────────────────────────
+  flower:
+    image: cm_backend:latest
+    container_name: cm_flower
+    restart: unless-stopped
+    command: >
+      celery -A backend.tasks flower
+        --port=5555
+        --broker=redis://redis:6379/1
+        --url_prefix=flower
+    environment:
+      CELERY_BROKER_URL:  redis://redis:6379/1
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
+    depends_on:
+      - redis
+      - celery_worker
+    networks:
+      - cctv_net
+    profiles:
+      - monitoring          # start with: docker compose --profile monitoring up -d
+
+  # ── Streamlit frontend ────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    image: cm_frontend:latest
+    container_name: cm_frontend
+    restart: unless-stopped
+    command: >
+      streamlit run frontend/app.py
+        --server.port=8501
+        --server.address=0.0.0.0
+        --server.headless=true
+        --server.fileWatcherType=none
+        --browser.gatherUsageStats=false
+    environment:
+      API_BASE_URL: http://backend:8000/api/v1
+      WS_BASE_URL:  ws://backend:8000/api/v1
+    ports:
+      - "${FRONTEND_PORT:-8501}:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - cctv_net
+
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  cctv_net:
+    driver: bridge
+    name: cctv_net
+
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    name: cm_postgres_data
+
+  redis_data:
+    name: cm_redis_data
+
+  insightface_cache:
+    name: cm_insightface_cache
+    # InsightFace downloads buffalo_l (~600 MB) on first use.
+    # Named volume persists the model cache across container rebuilds.
