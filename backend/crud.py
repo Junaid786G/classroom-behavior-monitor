@@ -17,11 +17,13 @@ from backend.models import (
     BehaviorEvent,
     BehaviorType,
     Classroom,
+    Course,
     FaceDetection,
     PoseSnapshot,
     Session,
     SessionStatus,
     Student,
+    Subject,
     VideoStatus,
     VideoUpload,
 )
@@ -97,6 +99,7 @@ async def get_student_by_code(db: AsyncSession, code: str) -> Optional[Student]:
 async def list_students(
     db: AsyncSession,
     classroom_id: Optional[int] = None,
+    course_id: Optional[int] = None,
     active_only: bool = True,
     skip: int = 0,
     limit: int = 50,
@@ -104,6 +107,8 @@ async def list_students(
     q = select(Student)
     if classroom_id is not None:
         q = q.where(Student.classroom_id == classroom_id)
+    if course_id is not None:
+        q = q.where(Student.course_id == course_id)
     if active_only:
         q = q.where(Student.is_active.is_(True))
 
@@ -165,6 +170,41 @@ async def delete_student(db: AsyncSession, student_id: int) -> bool:
     return r.rowcount > 0
 
 
+# ── Course & Subject ──────────────────────────────────────────────────────────
+
+async def get_course(db: AsyncSession, course_id: int) -> Optional[Course]:
+    r = await db.execute(select(Course).where(Course.id == course_id))
+    return r.scalar_one_or_none()
+
+
+async def list_courses(db: AsyncSession, active_only: bool = True) -> List[Course]:
+    q = select(Course)
+    if active_only:
+        q = q.where(Course.is_active.is_(True))
+    r = await db.execute(q.order_by(Course.id))
+    return list(r.scalars().all())
+
+
+async def get_subject(db: AsyncSession, subject_id: int) -> Optional[Subject]:
+    r = await db.execute(select(Subject).where(Subject.id == subject_id))
+    return r.scalar_one_or_none()
+
+
+async def list_subjects(
+    db: AsyncSession, course_id: int, active_only: bool = True
+) -> List[Subject]:
+    """Subjects for one course.
+
+    active_only hides archived rows such as the LEGACY-CS history bucket, which
+    must never be selectable for new sessions.
+    """
+    q = select(Subject).where(Subject.course_id == course_id)
+    if active_only:
+        q = q.where(Subject.is_active.is_(True))
+    r = await db.execute(q.order_by(Subject.subject_code))
+    return list(r.scalars().all())
+
+
 # ── Session ───────────────────────────────────────────────────────────────────
 
 async def create_session(db: AsyncSession, data: SessionCreate) -> Session:
@@ -177,6 +217,20 @@ async def create_session(db: AsyncSession, data: SessionCreate) -> Session:
 
 async def get_session(db: AsyncSession, session_id: UUID) -> Optional[Session]:
     r = await db.execute(select(Session).where(Session.id == session_id))
+    return r.scalar_one_or_none()
+
+
+async def get_session_course_id(db: AsyncSession, session_id: UUID) -> Optional[int]:
+    """Resolve a session's owning course via its subject.
+
+    Returns None only when the session does not exist: sessions.subject_id is
+    NOT NULL with an FK to subjects, so an existing session always resolves.
+    """
+    r = await db.execute(
+        select(Subject.course_id)
+        .join(Session, Session.subject_id == Subject.id)
+        .where(Session.id == session_id)
+    )
     return r.scalar_one_or_none()
 
 
