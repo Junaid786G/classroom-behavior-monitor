@@ -20,6 +20,8 @@ import requests
 import streamlit as st
 from PIL import Image
 
+from auth import render_sidebar_identity, require_login
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Live Monitor | Classroom CCTV",
@@ -31,6 +33,10 @@ st.set_page_config(
 # ── CSS ───────────────────────────────────────────────────────────────────────
 _css = (Path(__file__).parent.parent / "styles" / "main.css").read_text()
 st.markdown(f"<style>{_css}</style>", unsafe_allow_html=True)
+
+# ── Auth gate ─────────────────────────────────────────────────────────────────
+require_login()
+render_sidebar_identity()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000/api/v1")

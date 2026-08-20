@@ -394,3 +394,81 @@ h3 { color: var(--text-hi) !important; font-family: var(--font-mono) !important;
 /* ── Remove Streamlit branding ─────────────────────────────────────────────── */
 #MainMenu, footer, header { visibility: hidden !important; }
 [data-testid="stDeployButton"] { display: none !important; }
+
+/* ── Login screen ──────────────────────────────────────────────────────────── */
+/* Same gunmetal gradient and scan-line as .cctv-header, without the "● REC"
+   badge — a login box is not a recording. */
+.login-hero {
+  background: linear-gradient(135deg, #1e2530 0%, #2e3d50 50%, #1e2530 100%);
+  border: 1px solid #141c26;
+  border-radius: 8px;
+  padding: 1.6rem 1.8rem;
+  margin: 2.5rem 0 1.4rem;
+  position: relative;
+  overflow: hidden;
+  text-align: center;
+}
+.login-hero::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 0; right: 0; height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(245,200,66,0.5), transparent);
+  animation: scan-line 3s linear infinite;
+}
+.login-hero h1 {
+  margin: 0;
+  font-size: 1.35rem !important;
+  color: #f5c842 !important;
+  letter-spacing: 0.04em;
+}
+.login-hero p {
+  color: rgba(255,255,255,0.6);
+  margin: 0.35rem 0 0;
+  font-size: 0.78rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.login-note {
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 0.68rem;
+  font-family: var(--font-mono);
+  letter-spacing: 0.06em;
+  margin-top: 1.2rem;
+}
+
+/* ── Sidebar identity card ─────────────────────────────────────────────────── */
+/* !important throughout: [data-testid="stSidebar"] * already forces
+   color: var(--text-hi) on every descendant, and would flatten these. */
+.identity-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-left: 3px solid #4a5e2a;
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  margin: 0.4rem 0 0.6rem;
+}
+.identity-label {
+  font-size: 0.6rem !important;
+  color: var(--text-dim) !important;
+  letter-spacing: 0.14em;
+  font-weight: 600;
+}
+.identity-name {
+  font-size: 0.9rem !important;
+  color: #2e3d50 !important;
+  font-weight: 600;
+  margin-top: 0.15rem;
+  word-break: break-word;
+}
+.identity-role {
+  display: inline-block;
+  margin-top: 0.3rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 20px;
+  background: rgba(74,94,42,0.12);
+  color: #4a5e2a !important;
+  font-size: 0.66rem !important;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}

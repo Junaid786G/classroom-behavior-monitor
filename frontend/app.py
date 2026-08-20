@@ -9,6 +9,8 @@ from pathlib import Path
 import requests
 import streamlit as st
 
+from auth import render_sidebar_identity, require_login
+
 # ── Page config (must be first Streamlit call) ────────────────────────────────
 st.set_page_config(
     page_title="Classroom Monitor",
@@ -39,6 +41,12 @@ def _load_css() -> None:
         st.markdown(f"<style>{css_file.read_text()}</style>", unsafe_allow_html=True)
 
 _load_css()
+
+# ── Auth gate ─────────────────────────────────────────────────────────────────
+# Before anything else renders. Returns the user dict, or draws the login
+# screen and stops the script.
+require_login()
+render_sidebar_identity()
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=5)
