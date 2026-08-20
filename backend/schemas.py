@@ -88,6 +88,14 @@ class ClassroomOut(ClassroomBase):
     created_at: datetime
     updated_at: datetime
 
+    # Read the ORM attribute `metadata_`, not the inherited "metadata" alias:
+    # on a SQLAlchemy model `.metadata` is the declarative MetaData object, so
+    # validating by alias picks that up instead of the JSONB column. The wire
+    # format stays "metadata" via the serialization alias.
+    metadata_: Optional[Dict[str, Any]] = Field(
+        None, validation_alias="metadata_", serialization_alias="metadata"
+    )
+
 
 # ── Student ───────────────────────────────────────────────────────────────────
 

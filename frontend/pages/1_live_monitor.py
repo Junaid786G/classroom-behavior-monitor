@@ -206,9 +206,13 @@ with st.sidebar:
     st.markdown('<p class="section-label">▸ Session Control</p>', unsafe_allow_html=True)
 
     classrooms = _list_classrooms()
-    classroom_names = {c["name"]: c["id"] for c in classrooms} if classrooms else {"Default (id=1)": 1}
-    chosen_cls = st.selectbox("Classroom", list(classroom_names.keys()), key="cls_sel")
-    classroom_id = classroom_names[chosen_cls]
+    classroom_id = None
+    if not classrooms:
+        st.warning("No classrooms found – is the backend running and migrated?")
+    else:
+        classroom_names = {c["name"]: c["id"] for c in classrooms}
+        chosen_cls = st.selectbox("Classroom", list(classroom_names.keys()), key="cls_sel")
+        classroom_id = classroom_names[chosen_cls]
 
     # Course → subject. A session is scoped by its subject, which implies the
     # course; the classroom above is only the physical room / camera.
@@ -245,7 +249,9 @@ with st.sidebar:
 
     with col_a:
         if st.button("▶ New Session", use_container_width=True,
-                     disabled=st.session_state.processing or subject_id is None):
+                     disabled=(st.session_state.processing
+                               or subject_id is None
+                               or classroom_id is None)):
             payload = {
                 "subject_id":   subject_id,
                 "classroom_id": classroom_id,

@@ -53,11 +53,21 @@ async def get_classroom(db: AsyncSession, classroom_id: int) -> Optional[Classro
 
 
 async def list_classrooms(
-    db: AsyncSession, skip: int = 0, limit: int = 50
+    db: AsyncSession, active_only: bool = True, skip: int = 0, limit: int = 50
 ) -> Tuple[int, List[Classroom]]:
-    total = (await db.execute(select(func.count()).select_from(Classroom))).scalar_one()
+    """Classrooms ordered by id.
+
+    active_only hides decommissioned rooms so they cannot be picked as the
+    location for a new session.
+    """
+    q = select(Classroom)
+    count_q = select(func.count()).select_from(Classroom)
+    if active_only:
+        q = q.where(Classroom.is_active.is_(True))
+        count_q = count_q.where(Classroom.is_active.is_(True))
+    total = (await db.execute(count_q)).scalar_one()
     rows = (
-        await db.execute(select(Classroom).order_by(Classroom.id).offset(skip).limit(limit))
+        await db.execute(q.order_by(Classroom.id).offset(skip).limit(limit))
     ).scalars().all()
     return total, list(rows)
 
