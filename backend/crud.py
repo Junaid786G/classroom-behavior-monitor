@@ -24,6 +24,7 @@ from backend.models import (
     SessionStatus,
     Student,
     Subject,
+    User,
     VideoStatus,
     VideoUpload,
 )
@@ -725,3 +726,36 @@ async def get_attention_timeline(
         }
         for b, v in sorted(buckets.items())
     ]
+
+
+# ── Users & Auth ──────────────────────────────────────────────────────────────
+
+# instructor_assignments is eager-loaded on both lookups: the login token needs
+# it, and a lazy-load after the request's async session closes would raise.
+# Non-instructors just get an empty list, which costs one extra indexed query.
+_USER_LOADS = (selectinload(User.instructor_assignments),)
+
+
+async def get_user_by_username(db: AsyncSession, username: str) -> Optional[User]:
+    """Login lookup. Returns inactive users too — the caller checks the
+    password first, so that the reason for a refusal never depends on whether
+    the username exists."""
+    r = await db.execute(
+        select(User).options(*_USER_LOADS).where(User.username == username)
+    )
+    return r.scalar_one_or_none()
+
+
+async def get_user(db: AsyncSession, user_id: int) -> Optional[User]:
+    """Per-request lookup behind get_current_user — PK hit, no scan."""
+    r = await db.execute(
+        select(User).options(*_USER_LOADS).where(User.id == user_id)
+    )
+    return r.scalar_one_or_none()
+
+
+async def touch_last_login(db: AsyncSession, user_id: int) -> None:
+    """Stamp a successful login. Committed by get_db when the request ends."""
+    await db.execute(
+        update(User).where(User.id == user_id).values(last_login_at=_now())
+    )
