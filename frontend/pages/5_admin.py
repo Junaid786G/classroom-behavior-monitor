@@ -13,6 +13,7 @@ import requests
 import streamlit as st
 
 from auth import render_sidebar_identity, require_login
+from permissions import PAGE_ADMIN, require_page_access
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -28,6 +29,7 @@ st.markdown(f"<style>{_css}</style>", unsafe_allow_html=True)
 # ── Auth gate ─────────────────────────────────────────────────────────────────
 require_login()
 render_sidebar_identity()
+require_page_access(PAGE_ADMIN)
 
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000/api/v1")
 

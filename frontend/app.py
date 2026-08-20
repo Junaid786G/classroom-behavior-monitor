@@ -10,6 +10,15 @@ import requests
 import streamlit as st
 
 from auth import render_sidebar_identity, require_login
+from permissions import (
+    PAGE_ADMIN,
+    PAGE_ATTENDANCE,
+    PAGE_HOME,
+    PAGE_LIVE_MONITOR,
+    PAGE_STUDENT_DASHBOARD,
+    can_access,
+    require_page_access,
+)
 
 # ── Page config (must be first Streamlit call) ────────────────────────────────
 st.set_page_config(
@@ -47,6 +56,7 @@ _load_css()
 # screen and stops the script.
 require_login()
 render_sidebar_identity()
+role = require_page_access(PAGE_HOME)
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 @st.cache_data(ttl=5)
@@ -141,41 +151,41 @@ with left:
 with right:
     st.markdown('<p class="section-label">▸ Quick Actions</p>', unsafe_allow_html=True)
 
-    st.markdown("""
-    <div class="panel-card panel-card-hi">
-      <b style="color:#00ff88">📹 Live Monitor</b><br>
-      <span style="color:#8aabb8;font-size:0.8rem">
-        Stream or upload classroom video for real-time recognition.
-      </span>
-    </div>
-    """, unsafe_allow_html=True)
+    # Cards are filtered through PAGE_ACCESS, so Home never advertises a page
+    # the signed-in role would be refused on arrival.
+    _QUICK_ACTIONS = [
+        (PAGE_LIVE_MONITOR, "📹 Live Monitor", "#00ff88",
+         "Stream or upload classroom video for real-time recognition."),
+        (PAGE_ATTENDANCE, "📋 Attendance", "#00d4ff",
+         "View and export per-session attendance records."),
+        (PAGE_STUDENT_DASHBOARD, "📊 Student Dashboard", "#ffd700",
+         "Behavioural analytics charts and attention timelines."),
+        (PAGE_ADMIN, "⚙️ Admin Panel", "#ff8c2b",
+         "Register students, upload enrollment videos, rebuild gallery."),
+    ]
 
-    st.markdown("""
-    <div class="panel-card">
-      <b style="color:#00d4ff">📋 Attendance</b><br>
+    visible = [c for c in _QUICK_ACTIONS if can_access(role, c[0])]
+    if visible:
+        for idx, (_key, title, colour, blurb) in enumerate(visible):
+            # The highlight belongs to whichever card is first for THIS role,
+            # not to Live Monitor specifically.
+            hi = " panel-card-hi" if idx == 0 else ""
+            st.markdown(
+                f"""
+    <div class="panel-card{hi}">
+      <b style="color:{colour}">{title}</b><br>
       <span style="color:#8aabb8;font-size:0.8rem">
-        View and export per-session attendance records.
+        {blurb}
       </span>
     </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("""
-    <div class="panel-card">
-      <b style="color:#ffd700">📊 Student Dashboard</b><br>
-      <span style="color:#8aabb8;font-size:0.8rem">
-        Behavioural analytics charts and attention timelines.
-      </span>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("""
-    <div class="panel-card">
-      <b style="color:#ff8c2b">⚙️ Admin Panel</b><br>
-      <span style="color:#8aabb8;font-size:0.8rem">
-        Register students, upload enrollment videos, rebuild gallery.
-      </span>
-    </div>
-    """, unsafe_allow_html=True)
+    """,
+                unsafe_allow_html=True,
+            )
+    else:
+        st.info(
+            "No additional pages are available to your role yet. "
+            "Reports and setup screens arrive in a later phase."
+        )
 
     # Refresh button
     if st.button("↺  Refresh Dashboard", use_container_width=True):

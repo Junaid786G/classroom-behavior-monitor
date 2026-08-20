@@ -472,3 +472,27 @@ h3 { color: var(--text-hi) !important; font-family: var(--font-mono) !important;
   font-weight: 600;
   letter-spacing: 0.04em;
 }
+
+/* ── Access denied panel ───────────────────────────────────────────────────── */
+.access-denied {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--red);
+  border-radius: 8px;
+  padding: 1.4rem 1.6rem;
+  margin: 2rem 0 1rem;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+}
+.access-denied-title {
+  font-family: var(--font-hud);
+  font-size: 0.7rem;
+  color: var(--red);
+  letter-spacing: 0.18em;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+}
+.access-denied p {
+  margin: 0;
+  color: var(--text-hi);
+  font-size: 0.88rem;
+}

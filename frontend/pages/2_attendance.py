@@ -12,7 +12,8 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-from auth import render_sidebar_identity, require_login
+from auth import current_role, render_sidebar_identity, require_login
+from permissions import PAGE_ATTENDANCE, can_write_attendance, require_page_access
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -28,6 +29,7 @@ st.markdown(f"<style>{_css}</style>", unsafe_allow_html=True)
 # ── Auth gate ─────────────────────────────────────────────────────────────────
 require_login()
 render_sidebar_identity()
+require_page_access(PAGE_ATTENDANCE)
 
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000/api/v1")
 
@@ -223,7 +225,16 @@ with chart_col:
     st.divider()
     st.markdown('<p class="section-label">▸ Manual Override</p>', unsafe_allow_html=True)
 
-    if records:
+    # Page access alone is too coarse here. HOD is "read-only oversight" in
+    # backend/models.py, so rendering this block for them would contradict the
+    # role definition by handing them a write control on a page they are
+    # otherwise entitled to read.
+    if not can_write_attendance(current_role()):
+        st.caption(
+            "Attendance records are read-only for your role. "
+            "Manual overrides are made by the instructor who owns the session."
+        )
+    elif records:
         student_opts = {
             f"{(r.get('student') or {}).get('full_name', 'ID:' + str(r['student_id']))}": r["student_id"]
             for r in records
