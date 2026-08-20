@@ -40,7 +40,11 @@ _now = lambda: datetime.now(timezone.utc)
 # ── Classroom ─────────────────────────────────────────────────────────────────
 
 async def create_classroom(db: AsyncSession, data: ClassroomCreate) -> Classroom:
-    obj = Classroom(**data.model_dump(by_alias=True, exclude_none=True))
+    # Dump by field name, not by alias: the mapped attribute is `metadata_`,
+    # and passing the "metadata" alias instead sets a plain instance attribute
+    # that shadows SQLAlchemy's declarative MetaData, leaving the JSONB column
+    # unset and silently dropping the payload.
+    obj = Classroom(**data.model_dump(exclude_none=True))
     db.add(obj)
     await db.flush()
     await db.refresh(obj)
