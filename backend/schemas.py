@@ -12,6 +12,7 @@ from backend.models import (
     AttendanceStatus,
     BehaviorType,
     SessionStatus,
+    UserRole,
     VideoStatus,
 )
 
@@ -367,3 +368,69 @@ class HealthResponse(BaseModel):
     gallery_size: int
     gpu_available: bool
     version: str
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=80)
+    # No max_length: rejecting an over-length password here would tell an
+    # attacker where the bcrypt 72-byte ceiling is. verify_password returns a
+    # plain False for anything too long.
+    password: str = Field(..., min_length=1)
+
+
+class AssignmentOut(BaseModel):
+    """One course+subject pair an instructor may select."""
+    model_config = ConfigDict(from_attributes=True)
+
+    course_id: int
+    subject_id: int
+
+
+class UserOut(BaseModel):
+    """Identity as returned by /auth/login and /auth/me.
+
+    password_hash is absent by construction, not by exclusion — this model
+    lists what may leave the server, so a field cannot leak by being added to
+    the ORM model later.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    role: UserRole
+    full_name: Optional[str] = None
+    linked_student_id: Optional[int] = None
+    assignments: List[AssignmentOut] = []
+    last_login_at: Optional[datetime] = None
+
+    @classmethod
+    def from_user(cls, user) -> "UserOut":
+        """Build from a User loaded with instructor_assignments eager-loaded.
+
+        Written out rather than using from_attributes directly: the ORM
+        attribute is `instructor_assignments` and the wire field is
+        `assignments`, and a lazy-load here would raise on the async session.
+        """
+        return cls(
+            id=user.id,
+            username=user.username,
+            role=user.role,
+            full_name=user.full_name,
+            linked_student_id=user.linked_student_id,
+            assignments=[
+                AssignmentOut(course_id=a.course_id, subject_id=a.subject_id)
+                for a in user.instructor_assignments
+            ],
+            last_login_at=user.last_login_at,
+        )
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int = Field(..., description="Token lifetime in seconds")
+    # Inlined so the frontend can render the post-login screen without an
+    # immediate follow-up call to /auth/me.
+    user: UserOut
