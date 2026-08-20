@@ -73,6 +73,18 @@ def _list_classrooms():
     return data.get("items", [])
 
 
+@st.cache_data(ttl=10)
+def _list_courses():
+    data = _get("/courses") or {}
+    return data.get("items", [])
+
+
+@st.cache_data(ttl=10)
+def _list_subjects(course_id: int):
+    data = _get(f"/courses/{course_id}/subjects") or {}
+    return data.get("items", [])
+
+
 @st.cache_data(ttl=5)
 def _list_sessions(classroom_id=None):
     params = {"limit": 30}
@@ -194,11 +206,41 @@ with st.sidebar:
     st.markdown('<p class="section-label">▸ Session Control</p>', unsafe_allow_html=True)
 
     classrooms = _list_classrooms()
-    classroom_names = {c["name"]: c["id"] for c in classrooms} if classrooms else {"Default (id=1)": 1}
-    chosen_cls = st.selectbox("Classroom", list(classroom_names.keys()), key="cls_sel")
-    classroom_id = classroom_names[chosen_cls]
+    classroom_id = None
+    if not classrooms:
+        st.warning("No classrooms found – is the backend running and migrated?")
+    else:
+        classroom_names = {c["name"]: c["id"] for c in classrooms}
+        chosen_cls = st.selectbox("Classroom", list(classroom_names.keys()), key="cls_sel")
+        classroom_id = classroom_names[chosen_cls]
 
-    subject   = st.text_input("Subject",    "Computer Science")
+    # Course → subject. A session is scoped by its subject, which implies the
+    # course; the classroom above is only the physical room / camera.
+    courses = _list_courses()
+    subject_id = None
+    subject_label = ""
+    if not courses:
+        st.warning("No courses found – is the backend running and migrated?")
+    else:
+        course_names = {f"{c['code']} — {c['name']}": c["id"] for c in courses}
+        chosen_course = st.selectbox("Course", list(course_names.keys()), key="course_sel")
+        course_code = chosen_course.split(" — ", 1)[0]
+
+        subjects = _list_subjects(course_names[chosen_course])
+        if not subjects:
+            st.warning(
+                f"No subjects defined for {course_code} yet. Add one with:\n\n"
+                f"`python scripts/04_add_subject.py --course {course_code} "
+                f"--code <SUBJ> --name \"<Subject name>\"`"
+            )
+        else:
+            subject_names = {
+                f"{s['subject_code']} — {s['subject_name']}": s["id"] for s in subjects
+            }
+            chosen_subject = st.selectbox("Subject", list(subject_names.keys()), key="subj_sel")
+            subject_id = subject_names[chosen_subject]
+            subject_label = chosen_subject.split(" — ", 1)[-1]
+
     instructor = st.text_input("Instructor", "Dr. Ahmed")
 
     st.divider()
@@ -206,12 +248,18 @@ with st.sidebar:
     col_a, col_b = st.columns(2)
 
     with col_a:
-        if st.button("▶ New Session", use_container_width=True, disabled=st.session_state.processing):
+        if st.button("▶ New Session", use_container_width=True,
+                     disabled=(st.session_state.processing
+                               or subject_id is None
+                               or classroom_id is None)):
             payload = {
+                "subject_id":   subject_id,
                 "classroom_id": classroom_id,
-                "subject":      subject,
+                # Deprecated free-text mirror, still sent so the dashboards that
+                # read `subject` keep rendering until they move to subject_id.
+                "subject":      subject_label,
                 "instructor":   instructor,
-                "title":        f"{subject} – {time.strftime('%H:%M')}",
+                "title":        f"{subject_label} – {time.strftime('%H:%M')}",
             }
             resp = _post("/sessions", json=payload)
             if resp and "id" in resp:

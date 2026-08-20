@@ -27,7 +27,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend import crud
 from backend.config import get_settings
 from backend.database import AsyncSessionLocal, get_db
-from backend.models import AlertSeverity, AlertType, AttendanceStatus, BehaviorType, VideoStatus
+from backend.models import (
+    AlertSeverity,
+    AlertType,
+    AttendanceStatus,
+    BehaviorType,
+    SessionStatus,
+    VideoStatus,
+)
 from backend.pipeline.annotator import annotate_frame
 from backend.pipeline.behavior import BehaviorFrame, get_behavior_analyzer
 from backend.pipeline.capture import VideoCapture, get_video_metadata
@@ -54,6 +61,12 @@ async def create_session(
     data: SessionCreate,
     db: AsyncSession = Depends(get_db),
 ):
+    # Validate up front so a bad subject_id is a 422, not a raw FK-violation 500.
+    if await crud.get_subject(db, data.subject_id) is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Subject {data.subject_id} does not exist",
+        )
     session = await crud.create_session(db, data)
     return SessionOut.model_validate(session)
 
@@ -150,6 +163,28 @@ async def get_video_status(
     return VideoUploadOut.model_validate(v)
 
 
+# ── Roster scoping ────────────────────────────────────────────────────────────
+
+def _gate_to_roster(results: List[RecognitionResult], roster_ids: frozenset) -> None:
+    """Drop recognised identities that are not on this session's roster, in place.
+
+    The FAISS gallery is department-wide, so `best_match` can return a student
+    enrolled in a different course. Scoping the roster query alone is NOT
+    enough: `student_map` only supplies the display name, while `student_id`
+    flows straight into attendance_records and behavior_events. Demote an
+    off-roster match to an unknown face so it is counted as an unrecognised
+    person rather than attributed to a student who was never in the room.
+
+    Called before behaviour analysis so analysis, annotation and persistence all
+    see the same identity - no downstream path can disagree about who this is.
+    """
+    for r in results:
+        if r.student_id is not None and r.student_id not in roster_ids:
+            r.student_id = None
+            r.student_name = None
+            r.recognition_score = 0.0
+
+
 # ── WebSocket live inference ──────────────────────────────────────────────────
 
 def _source_frame_and_ms(msg_index: int, frame_step: int, fps: float) -> Tuple[int, int]:
@@ -210,9 +245,18 @@ async def live_stream(
             await websocket.close(code=4004, reason="Session not found")
             return
 
-        # Load student roster for this classroom
-        _, students = await crud.list_students(db, classroom_id=session.classroom_id, limit=10_000)
+        # Scope the roster to the session's COURSE, not its classroom. A room is
+        # physical and can host several courses, so classroom scoping would mix
+        # rosters the moment a second course is recorded in the same room.
+        course_id = await crud.get_session_course_id(db, session_id)
+        if course_id is None:
+            # Defensive: unreachable while subject_id is NOT NULL and the
+            # session was just confirmed to exist.
+            await websocket.close(code=4004, reason="Session has no subject/course")
+            return
+        _, students = await crud.list_students(db, course_id=course_id, limit=10_000)
         student_map = {s.id: s.full_name for s in students}
+        roster_ids = frozenset(student_map)
 
         await crud.start_session(db, session_id)
 
@@ -233,6 +277,7 @@ async def live_stream(
             results: List[RecognitionResult] = recognizer.process_frame(
                 frame, frame_number, timestamp_ms, student_map
             )
+            _gate_to_roster(results, roster_ids)
             # Run behaviour analysis
             behaviors: List[BehaviorFrame] = behavior_analyzer.analyze_frame(frame, results, timestamp_ms)
             bmap = {b.track_id: b for b in behaviors}
@@ -310,9 +355,25 @@ async def _process_video_bg(upload_id: str, video_path: str, session_id: str) ->
         meta = get_video_metadata(video_path)
         await crud.update_video_status(db, uid, VideoStatus.PROCESSING, extra_meta=meta)
 
-        # Load student roster
-        _, students = await crud.list_students(db, limit=10_000)
+        # Roster MUST be scoped to this session's course. Loading every student
+        # in the department let the department-wide FAISS gallery attribute a
+        # face to someone not enrolled here, writing bogus attendance and
+        # behavior rows against them. The live WS path scopes the same query.
+        course_id = await crud.get_session_course_id(db, sid)
+        if course_id is None:
+            # Reachable here (unlike the WS path): the session may have been
+            # deleted between upload and background processing. Fail closed -
+            # processing against the wrong roster is worse than a visible error.
+            logger.error("session=%s has no resolvable course; aborting video %s", sid, uid)
+            await crud.update_video_status(
+                db, uid, VideoStatus.ERROR,
+                error_message=f"Session {sid} has no subject/course - cannot resolve roster",
+            )
+            await crud.end_session(db, sid, status=SessionStatus.FAILED)
+            return
+        _, students = await crud.list_students(db, course_id=course_id, limit=10_000)
         student_map = {s.id: s.full_name for s in students}
+        roster_ids = frozenset(student_map)
 
     recognizer = await get_recognizer()
     behavior_analyzer = get_behavior_analyzer()
@@ -329,6 +390,7 @@ async def _process_video_bg(upload_id: str, video_path: str, session_id: str) ->
 
             for frame_number, timestamp_ms, frame in cap.frames():
                 results = recognizer.process_frame(frame, frame_number, timestamp_ms, student_map)
+                _gate_to_roster(results, roster_ids)
                 behaviors = behavior_analyzer.analyze_frame(frame, results, timestamp_ms)
 
                 bmap = {b.track_id: b for b in behaviors}
@@ -408,7 +470,6 @@ async def _process_video_bg(upload_id: str, video_path: str, session_id: str) ->
         logger.exception("Video processing failed for upload %s: %s", upload_id, exc)
         async with AsyncSessionLocal() as db:
             await crud.update_video_status(db, uid, VideoStatus.ERROR, error_message=str(exc))
-            from backend.models import SessionStatus
             await crud.end_session(db, sid, status=SessionStatus.FAILED)
 
 

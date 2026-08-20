@@ -17,11 +17,13 @@ from backend.models import (
     BehaviorEvent,
     BehaviorType,
     Classroom,
+    Course,
     FaceDetection,
     PoseSnapshot,
     Session,
     SessionStatus,
     Student,
+    Subject,
     VideoStatus,
     VideoUpload,
 )
@@ -38,7 +40,11 @@ _now = lambda: datetime.now(timezone.utc)
 # ── Classroom ─────────────────────────────────────────────────────────────────
 
 async def create_classroom(db: AsyncSession, data: ClassroomCreate) -> Classroom:
-    obj = Classroom(**data.model_dump(by_alias=True, exclude_none=True))
+    # Dump by field name, not by alias: the mapped attribute is `metadata_`,
+    # and passing the "metadata" alias instead sets a plain instance attribute
+    # that shadows SQLAlchemy's declarative MetaData, leaving the JSONB column
+    # unset and silently dropping the payload.
+    obj = Classroom(**data.model_dump(exclude_none=True))
     db.add(obj)
     await db.flush()
     await db.refresh(obj)
@@ -51,11 +57,21 @@ async def get_classroom(db: AsyncSession, classroom_id: int) -> Optional[Classro
 
 
 async def list_classrooms(
-    db: AsyncSession, skip: int = 0, limit: int = 50
+    db: AsyncSession, active_only: bool = True, skip: int = 0, limit: int = 50
 ) -> Tuple[int, List[Classroom]]:
-    total = (await db.execute(select(func.count()).select_from(Classroom))).scalar_one()
+    """Classrooms ordered by id.
+
+    active_only hides decommissioned rooms so they cannot be picked as the
+    location for a new session.
+    """
+    q = select(Classroom)
+    count_q = select(func.count()).select_from(Classroom)
+    if active_only:
+        q = q.where(Classroom.is_active.is_(True))
+        count_q = count_q.where(Classroom.is_active.is_(True))
+    total = (await db.execute(count_q)).scalar_one()
     rows = (
-        await db.execute(select(Classroom).order_by(Classroom.id).offset(skip).limit(limit))
+        await db.execute(q.order_by(Classroom.id).offset(skip).limit(limit))
     ).scalars().all()
     return total, list(rows)
 
@@ -97,6 +113,7 @@ async def get_student_by_code(db: AsyncSession, code: str) -> Optional[Student]:
 async def list_students(
     db: AsyncSession,
     classroom_id: Optional[int] = None,
+    course_id: Optional[int] = None,
     active_only: bool = True,
     skip: int = 0,
     limit: int = 50,
@@ -104,6 +121,8 @@ async def list_students(
     q = select(Student)
     if classroom_id is not None:
         q = q.where(Student.classroom_id == classroom_id)
+    if course_id is not None:
+        q = q.where(Student.course_id == course_id)
     if active_only:
         q = q.where(Student.is_active.is_(True))
 
@@ -165,6 +184,41 @@ async def delete_student(db: AsyncSession, student_id: int) -> bool:
     return r.rowcount > 0
 
 
+# ── Course & Subject ──────────────────────────────────────────────────────────
+
+async def get_course(db: AsyncSession, course_id: int) -> Optional[Course]:
+    r = await db.execute(select(Course).where(Course.id == course_id))
+    return r.scalar_one_or_none()
+
+
+async def list_courses(db: AsyncSession, active_only: bool = True) -> List[Course]:
+    q = select(Course)
+    if active_only:
+        q = q.where(Course.is_active.is_(True))
+    r = await db.execute(q.order_by(Course.id))
+    return list(r.scalars().all())
+
+
+async def get_subject(db: AsyncSession, subject_id: int) -> Optional[Subject]:
+    r = await db.execute(select(Subject).where(Subject.id == subject_id))
+    return r.scalar_one_or_none()
+
+
+async def list_subjects(
+    db: AsyncSession, course_id: int, active_only: bool = True
+) -> List[Subject]:
+    """Subjects for one course.
+
+    active_only hides archived rows such as the LEGACY-CS history bucket, which
+    must never be selectable for new sessions.
+    """
+    q = select(Subject).where(Subject.course_id == course_id)
+    if active_only:
+        q = q.where(Subject.is_active.is_(True))
+    r = await db.execute(q.order_by(Subject.subject_code))
+    return list(r.scalars().all())
+
+
 # ── Session ───────────────────────────────────────────────────────────────────
 
 async def create_session(db: AsyncSession, data: SessionCreate) -> Session:
@@ -177,6 +231,20 @@ async def create_session(db: AsyncSession, data: SessionCreate) -> Session:
 
 async def get_session(db: AsyncSession, session_id: UUID) -> Optional[Session]:
     r = await db.execute(select(Session).where(Session.id == session_id))
+    return r.scalar_one_or_none()
+
+
+async def get_session_course_id(db: AsyncSession, session_id: UUID) -> Optional[int]:
+    """Resolve a session's owning course via its subject.
+
+    Returns None only when the session does not exist: sessions.subject_id is
+    NOT NULL with an FK to subjects, so an existing session always resolves.
+    """
+    r = await db.execute(
+        select(Subject.course_id)
+        .join(Session, Session.subject_id == Subject.id)
+        .where(Session.id == session_id)
+    )
     return r.scalar_one_or_none()
 
 

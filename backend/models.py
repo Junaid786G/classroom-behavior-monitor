@@ -3,9 +3,13 @@ ORM models for the classroom CCTV monitoring system.
 
 Tables
 ------
+courses             – academic cohorts (99B, 100B … 104B)
+subjects            – subjects taught within one course
 classrooms          – physical rooms
-students            – enrolled students + face gallery metadata
-sessions            – a single monitoring / recording session per classroom
+students            – enrolled students + face gallery metadata (exactly one course each)
+users               – single login table for all four roles
+instructor_assignments – which course+subject pairs an instructor may select
+sessions            – a single monitoring / recording session (scoped to one subject)
 attendance_records  – per-student presence confirmed during a session
 video_uploads       – raw video files associated with a session
 face_detections     – every detected face event (timestamped, with track id)
@@ -24,10 +28,12 @@ from typing import List, Optional
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     LargeBinary,
@@ -92,6 +98,35 @@ class VideoStatus(str, enum.Enum):
     ERROR = "error"
 
 
+class UserRole(str, enum.Enum):
+    """Roles for the single `users` login table.
+
+    HOD              – read-only oversight: department-wide analytics,
+                       attendance and behaviour reports across all courses.
+                       Never touches setup.
+    INSTRUCTOR       – live monitoring and reports for the course+subject pairs
+                       granted in instructor_assignments, PLUS the existing
+                       Admin panel (face gallery, detection/behaviour
+                       thresholds, student enrolment), which remains an
+                       instructor responsibility.
+    STUDENT          – own records only, via linked_student_id.
+    TRAINING_CONTROL – setup only: creates/edits courses and subjects, creates
+                       instructor accounts, and assigns instructors to course+
+                       subject pairs. No video monitoring, no gallery or
+                       threshold access, no analytics dashboards. Deliberately
+                       NOT named "admin": the Admin panel belongs to INSTRUCTOR.
+
+    NOTE: SQLAlchemy persists the enum *name*, so the DB labels are
+    'HOD' / 'INSTRUCTOR' / 'STUDENT' / 'TRAINING_CONTROL' (uppercase),
+    consistent with every other enum in this schema. The lowercase values are
+    what the API layer speaks.
+    """
+    HOD = "hod"
+    INSTRUCTOR = "instructor"
+    STUDENT = "student"
+    TRAINING_CONTROL = "training_control"
+
+
 # ── Mixins ────────────────────────────────────────────────────────────────────
 
 
@@ -105,6 +140,68 @@ class TimestampMixin:
         onupdate=func.now(),
         nullable=False,
     )
+
+
+# ── Courses & Subjects ────────────────────────────────────────────────────────
+
+
+class Course(TimestampMixin, Base):
+    """An academic cohort, e.g. CAE Avionics 99B."""
+
+    __tablename__ = "courses"
+    __table_args__ = (UniqueConstraint("code", name="uq_courses_code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(20), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    subjects: Mapped[List["Subject"]] = relationship(
+        back_populates="course", cascade="all, delete-orphan"
+    )
+    students: Mapped[List["Student"]] = relationship(
+        back_populates="course", foreign_keys="Student.course_id"
+    )
+
+    def __repr__(self) -> str:
+        return f"<Course id={self.id} code={self.code!r}>"
+
+
+class Subject(TimestampMixin, Base):
+    """One subject taught within one course.
+
+    `subject_code` is unique *per course*, not globally: the same subject taught
+    to 99B and to 100B is two independent rows, with independent instructor
+    assignments and independent session history. That independence is what lets
+    an empty course (100B-104B) become a populated one with zero code changes.
+    """
+
+    __tablename__ = "subjects"
+    __table_args__ = (
+        UniqueConstraint("course_id", "subject_code", name="uq_subjects_course_code"),
+        # Target for the composite FK from instructor_assignments, which pins an
+        # assignment's course_id to its subject's own course_id.
+        UniqueConstraint("id", "course_id", name="uq_subjects_id_course"),
+        Index("ix_subjects_course_id", "course_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    course_id: Mapped[int] = mapped_column(
+        ForeignKey("courses.id", ondelete="CASCADE"), nullable=False
+    )
+    subject_code: Mapped[str] = mapped_column(String(40), nullable=False)
+    subject_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Archived subjects stay fully queryable but are hidden from pickers.
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    course: Mapped["Course"] = relationship(back_populates="subjects")
+    sessions: Mapped[List["Session"]] = relationship(back_populates="subject_ref")
+    instructor_assignments: Mapped[List["InstructorAssignment"]] = relationship(
+        back_populates="subject", cascade="all, delete-orphan"
+    )
+
+    def __repr__(self) -> str:
+        return f"<Subject id={self.id} code={self.subject_code!r} course={self.course_id}>"
 
 
 # ── Classrooms ────────────────────────────────────────────────────────────────
@@ -139,12 +236,21 @@ class Student(TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("student_code", name="uq_students_code"),
         Index("ix_students_classroom_id", "classroom_id"),
+        Index("ix_students_course_id", "course_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     student_code: Mapped[str] = mapped_column(String(40), nullable=False)
     full_name: Mapped[str] = mapped_column(String(200), nullable=False)
     email: Mapped[Optional[str]] = mapped_column(String(320))
+    # Academic cohort - exactly one per student. Rosters are independent per
+    # course, so there is deliberately no many-to-many here.
+    # RESTRICT: deleting a course that still has a roster must fail loudly
+    # rather than orphan students or cascade into their attendance history.
+    course_id: Mapped[int] = mapped_column(
+        ForeignKey("courses.id", ondelete="RESTRICT"), nullable=False
+    )
+    # Physical room (camera, capacity) - orthogonal to the course, retained.
     classroom_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("classrooms.id", ondelete="SET NULL")
     )
@@ -166,6 +272,12 @@ class Student(TimestampMixin, Base):
     classroom: Mapped[Optional["Classroom"]] = relationship(
         back_populates="students", foreign_keys=[classroom_id]
     )
+    course: Mapped["Course"] = relationship(
+        back_populates="students", foreign_keys=[course_id]
+    )
+    login: Mapped[Optional["User"]] = relationship(
+        back_populates="linked_student", uselist=False
+    )
     attendance_records: Mapped[List["AttendanceRecord"]] = relationship(
         back_populates="student"
     )
@@ -180,6 +292,119 @@ class Student(TimestampMixin, Base):
         return f"<Student id={self.id} code={self.student_code!r} name={self.full_name!r}>"
 
 
+# ── Users & Instructor Assignments ────────────────────────────────────────────
+
+
+class User(TimestampMixin, Base):
+    """Single login table for all four roles.
+
+    A STUDENT row must point at a roster row via `linked_student_id`; HOD,
+    INSTRUCTOR and TRAINING_CONTROL rows must not. Both halves are enforced by
+    the DB constraint `ck_users_student_link`, so a student login can never
+    drift loose from the data it is supposed to show.
+    """
+
+    __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("username", name="uq_users_username"),
+        # At most one login per student.
+        UniqueConstraint("linked_student_id", name="uq_users_linked_stu"),
+        # Written as a closed form over the complement (= 'STUDENT' vs
+        # <> 'STUDENT') rather than by listing the non-student roles, so any
+        # role added later - TRAINING_CONTROL was - defaults to the restrictive
+        # branch instead of silently escaping the check.
+        CheckConstraint(
+            "(role = 'STUDENT' AND linked_student_id IS NOT NULL) OR "
+            "(role <> 'STUDENT' AND linked_student_id IS NULL)",
+            name="ck_users_student_link",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    role: Mapped[UserRole] = mapped_column(
+        Enum(UserRole, name="user_role_enum"), nullable=False
+    )
+    username: Mapped[str] = mapped_column(String(80), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    full_name: Mapped[Optional[str]] = mapped_column(String(200))
+    # SET NULL would violate ck_users_student_link, so deleting a student who
+    # still has a login fails loudly instead of leaving a live orphan account.
+    # crud.delete_student must remove the user row first (Phase 2).
+    linked_student_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("students.id", ondelete="SET NULL")
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    linked_student: Mapped[Optional["Student"]] = relationship(back_populates="login")
+    instructor_assignments: Mapped[List["InstructorAssignment"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+    def __repr__(self) -> str:
+        return f"<User id={self.id} role={self.role} username={self.username!r}>"
+
+
+class InstructorAssignment(TimestampMixin, Base):
+    """Exactly which course+subject pairs one instructor may select.
+
+    Rows here are created by a TRAINING_CONTROL user and consumed by an
+    INSTRUCTOR to scope the course -> subject -> source -> start flow.
+
+    `course_id` is redundant with `subject.course_id` by design - it is kept for
+    cheap filtering ("which courses can this instructor see") without a join.
+    To stop the two ever disagreeing, the subject is referenced by a *composite*
+    FK on (subject_id, course_id), so a row cannot claim a course that its own
+    subject does not belong to.
+
+    KNOWN PHASE 1 GAP (accepted, deferred to Phase 2): `user_id` is a plain FK
+    to users.id, so nothing at the schema level stops a HOD, STUDENT or
+    TRAINING_CONTROL row being assigned here. Role integrity is enforced by
+    application code for now; the structural fix is a UNIQUE (id, role) on
+    users plus a pinned user_role column referenced by a composite FK.
+    """
+
+    __tablename__ = "instructor_assignments"
+    __table_args__ = (
+        UniqueConstraint("user_id", "subject_id", name="uq_instr_assign"),
+        ForeignKeyConstraint(
+            ["subject_id", "course_id"],
+            ["subjects.id", "subjects.course_id"],
+            ondelete="CASCADE",
+            name="fk_instr_assign_subject",
+        ),
+        Index("ix_instr_assign_user", "user_id"),
+        Index("ix_instr_assign_subject", "subject_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    course_id: Mapped[int] = mapped_column(
+        ForeignKey("courses.id", ondelete="CASCADE"), nullable=False
+    )
+    # No standalone FK - covered by the composite constraint above.
+    subject_id: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    user: Mapped["User"] = relationship(back_populates="instructor_assignments")
+    # viewonly: course_id is written solely through `subject` (the composite FK
+    # sources it from subjects.course_id). Without this, both relationships
+    # target the same column and the flushed value depends on flush order.
+    # Set `subject`; read `course`.
+    course: Mapped["Course"] = relationship(foreign_keys=[course_id], viewonly=True)
+    subject: Mapped["Subject"] = relationship(
+        back_populates="instructor_assignments",
+        foreign_keys=[subject_id, course_id],
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<InstructorAssignment user={self.user_id} "
+            f"course={self.course_id} subject={self.subject_id}>"
+        )
+
+
 # ── Sessions ──────────────────────────────────────────────────────────────────
 
 
@@ -187,15 +412,27 @@ class Session(TimestampMixin, Base):
     """One monitoring session (e.g. a single lecture)."""
 
     __tablename__ = "sessions"
-    __table_args__ = (Index("ix_sessions_classroom_started", "classroom_id", "started_at"),)
+    __table_args__ = (
+        Index("ix_sessions_classroom_started", "classroom_id", "started_at"),
+        Index("ix_sessions_subject_started", "subject_id", "started_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # The subject implies the course (subject.course_id). There is deliberately
+    # no sessions.course_id: a second path to the course could disagree with
+    # this one. RESTRICT so a subject with recorded history cannot be deleted.
+    subject_id: Mapped[int] = mapped_column(
+        ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
     )
     classroom_id: Mapped[int] = mapped_column(
         ForeignKey("classrooms.id", ondelete="CASCADE"), nullable=False
     )
     title: Mapped[Optional[str]] = mapped_column(String(200))
+    # DEPRECATED: free-text subject, superseded by subject_id. Retained so the
+    # existing frontend pages keep rendering; dropped in a later phase once the
+    # UI reads through subject_id.
     subject: Mapped[Optional[str]] = mapped_column(String(120))
     instructor: Mapped[Optional[str]] = mapped_column(String(200))
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -209,6 +446,9 @@ class Session(TimestampMixin, Base):
     summary: Mapped[Optional[dict]] = mapped_column(JSONB)
 
     classroom: Mapped["Classroom"] = relationship(back_populates="sessions")
+    # Named subject_ref, not subject: the name `subject` is taken by the
+    # deprecated free-text column above.
+    subject_ref: Mapped["Subject"] = relationship(back_populates="sessions")
     video_uploads: Mapped[List["VideoUpload"]] = relationship(back_populates="session")
     attendance_records: Mapped[List["AttendanceRecord"]] = relationship(
         back_populates="session"

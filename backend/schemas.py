@@ -29,6 +29,31 @@ class Page(BaseModel):
     items: List[Any]
 
 
+# ── Course & Subject ──────────────────────────────────────────────────────────
+
+class CourseOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    code: str
+    name: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class SubjectOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    course_id: int
+    subject_code: str
+    subject_name: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
 # ── Classroom ─────────────────────────────────────────────────────────────────
 
 class ClassroomBase(BaseModel):
@@ -62,6 +87,14 @@ class ClassroomOut(ClassroomBase):
     id: int
     created_at: datetime
     updated_at: datetime
+
+    # Read the ORM attribute `metadata_`, not the inherited "metadata" alias:
+    # on a SQLAlchemy model `.metadata` is the declarative MetaData object, so
+    # validating by alias picks that up instead of the JSONB column. The wire
+    # format stays "metadata" via the serialization alias.
+    metadata_: Optional[Dict[str, Any]] = Field(
+        None, validation_alias="metadata_", serialization_alias="metadata"
+    )
 
 
 # ── Student ───────────────────────────────────────────────────────────────────
@@ -100,8 +133,12 @@ class StudentOut(StudentBase):
 # ── Session ───────────────────────────────────────────────────────────────────
 
 class SessionCreate(BaseModel):
+    # Required: sessions.subject_id is NOT NULL. The subject implies the course.
+    subject_id: int
     classroom_id: int
     title: Optional[str] = Field(None, max_length=200)
+    # DEPRECATED free-text label, superseded by subject_id. Retained so existing
+    # dashboards that read `subject` keep rendering.
     subject: Optional[str] = Field(None, max_length=120)
     instructor: Optional[str] = Field(None, max_length=200)
 
@@ -117,6 +154,7 @@ class SessionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
+    subject_id: int
     classroom_id: int
     title: Optional[str] = None
     subject: Optional[str] = None
