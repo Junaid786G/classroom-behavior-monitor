@@ -24,8 +24,10 @@ in the server process, per browser session — is not one either.
 
 from __future__ import annotations
 
+import base64
 import os
 import time
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -139,19 +141,118 @@ def _attempt_login(username: str, password: str) -> Optional[str]:
     return f"Login failed ({r.status_code})."
 
 
+# ── Login background image ────────────────────────────────────────────────────
+
+# The full 1280x640 frame at JPEG q90 (94KB). Deliberately not cropped: this
+# fills the viewport with background-size:cover, so the crop is the browser's
+# to make against whatever aspect ratio the window happens to be.
+_LOGIN_BG = Path(__file__).parent / "assets" / "f16_login.jpg"
+
+
+@st.cache_data(show_spinner=False)
+def _login_bg_uri() -> str:
+    """The background image as a data: URI, or "" when the asset is missing.
+
+    Inlined because CSS is the only way to get background-size:cover, and
+    Streamlit exposes no stable URL for a file on disk that CSS could point at.
+
+    A missing or unreadable file returns "" and the caller falls back to the
+    ordinary khaki theme rather than raising: the login screen is the one
+    screen that has to draw no matter what. Cached so the encode happens once
+    per process, not once per submit.
+    """
+    try:
+        data = base64.b64encode(_LOGIN_BG.read_bytes()).decode("ascii")
+    except OSError:
+        return ""
+    return f"data:image/jpeg;base64,{data}"
+
+
+# Applied only while logged out, so main.css's khaki theme is untouched
+# everywhere else. {uri} is substituted, not f-string interpolated — the CSS is
+# full of braces. Kept whole so that a missing asset drops the entire dark
+# treatment together: a dark wash and a light form panel over no image at all
+# would just look broken.
+_LOGIN_BG_CSS = """
+/* The photo under two washes, all in one background-image so the gradients
+   are guaranteed to sit over it. The horizontal one does the real work: light
+   over the left, where the aircraft is, heavy on the right third, where the
+   card and form sit and text has to stay readable. The vertical one is just
+   mood. !important because main.css sets background-color on these same
+   selectors with !important; fixed so a short viewport cannot slide the jet
+   up out of frame.
+
+   background-position is pushed right (85%) so the browser crops from the
+   left: that walks the jet away from the form. It is a small move — at
+   1920x1080 the image renders 2160px wide, so there is only ~120px of slack
+   either way — which is why the form moves too, in the columns below. */
+[data-testid="stAppViewContainer"], [data-testid="stApp"] {
+  background-image:
+    linear-gradient(90deg,
+      rgba(14,19,26,0.30) 0%,
+      rgba(14,19,26,0.34) 38%,
+      rgba(14,19,26,0.72) 62%,
+      rgba(14,19,26,0.84) 100%),
+    linear-gradient(180deg,
+      rgba(14,19,26,0.42) 0%,
+      rgba(14,19,26,0.38) 45%,
+      rgba(14,19,26,0.66) 100%),
+    url("{uri}") !important;
+  background-size: cover !important;
+  background-position: 85% center !important;
+  background-repeat: no-repeat !important;
+  background-attachment: fixed !important;
+}
+/* Let the image run edge to edge — on this screen the sidebar is an empty
+   cream strip (its nav is hidden above) and the header a cream bar. */
+[data-testid="stSidebar"] {
+  background: transparent !important;
+  border-right: none !important;
+}
+[data-testid="stSidebar"] * {color: rgba(255,255,255,0.72) !important;}
+[data-testid="stHeader"] {background: transparent !important;}
+
+/* The form is the one bright object on a dark field — that is what keeps it,
+   not the jet, the thing you look at. It needs an explicit panel because
+   main.css leaves stForm transparent and colours labels --text-hi (#1e2530),
+   which over the wash would be near-black on near-black. */
+[data-testid="stForm"] {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--border-hi) !important;
+  border-radius: 10px !important;
+  padding: 1.15rem 1.25rem !important;
+  box-shadow: 0 20px 48px rgba(0,0,0,0.55) !important;
+}
+/* Lift the hero card off the photo it now sits on. */
+.login-hero {box-shadow: 0 20px 48px rgba(0,0,0,0.55) !important;}
+/* --text-dim is tuned for khaki; on the wash it goes nearly invisible. */
+.login-note {color: rgba(255,255,255,0.62) !important;}
+"""
+
+
 # ── Screens ───────────────────────────────────────────────────────────────────
 
 def _render_login_screen(expired: bool) -> None:
     """Draw the login form and stop the page. Never returns."""
     # Hide the page nav while logged out. Conditional, so it cannot live in
-    # main.css — there is no state class on <body> for CSS to key off.
+    # main.css — there is no state class on <body> for CSS to key off. Same
+    # reason the background lives here: main.css paints every screen, and this
+    # image is for the logged-out one only. Streamlit discards the previous
+    # run's elements on rerun, so the moment login succeeds this <style> goes
+    # with them and the khaki theme is back.
+    bg_uri = _login_bg_uri()
     st.markdown(
         "<style>[data-testid='stSidebarNav'], [data-testid='stSidebarNavItems']"
-        "{display:none !important;}</style>",
+        "{display:none !important;}"
+        + (_LOGIN_BG_CSS.replace("{uri}", bg_uri) if bg_uri else "")
+        + "</style>",
         unsafe_allow_html=True,
     )
 
-    left, mid, right = st.columns([1, 1.5, 1])
+    # Off-centre on purpose: dead-centre puts the card straight over the jet's
+    # nose and cockpit, which is the one part of the image worth seeing. The
+    # right third of the frame is open haze, so the form goes there.
+    left, mid = st.columns([1.5, 1])
     with mid:
         st.markdown(
             """
