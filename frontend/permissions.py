@@ -61,6 +61,7 @@ PAGE_STUDENT_DASHBOARD = "student_dashboard"
 PAGE_CLASSROOM_DASHBOARD = "classroom_dashboard"
 PAGE_ADMIN = "admin"
 PAGE_COURSE_OVERVIEW = "course_overview"
+PAGE_STUDENT_PORTAL = "student_portal"
 
 PAGE_TITLE = {
     PAGE_HOME: "Home Dashboard",
@@ -70,6 +71,7 @@ PAGE_TITLE = {
     PAGE_CLASSROOM_DASHBOARD: "Classroom Dashboard",
     PAGE_ADMIN: "Admin Panel",
     PAGE_COURSE_OVERVIEW: "Course Overview",
+    PAGE_STUDENT_PORTAL: "My Records",
 }
 
 # ── The policy ────────────────────────────────────────────────────────────────
@@ -113,6 +115,13 @@ PAGE_ACCESS = {
     # deliberately: the page rolls up every session in a course whoever taught
     # it, which is the oversight view, not the teaching one.
     PAGE_COURSE_OVERVIEW: frozenset({ROLE_HOD}),
+
+    # A student's own records, and the only page a STUDENT can open besides
+    # Home. Not to be confused with PAGE_STUDENT_DASHBOARD above, which is the
+    # staff view of ANY student and stays HOD+INSTRUCTOR. The scoping that
+    # matters is server-side: /me/records reads linked_student_id off the
+    # authenticated row and takes no student id from the caller.
+    PAGE_STUDENT_PORTAL: frozenset({ROLE_STUDENT}),
 }
 
 # Roles permitted to CHANGE attendance, as opposed to reading it. HOD is
