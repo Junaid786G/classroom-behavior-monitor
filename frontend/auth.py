@@ -273,6 +273,46 @@ _LOGIN_BG_CSS = """
 """
 
 
+# ── Password change ───────────────────────────────────────────────────────────
+
+# Mirrors backend/schemas.py MIN_PASSWORD_LENGTH. Checked here only to save a
+# round trip - the server is the one that decides.
+MIN_PASSWORD_LENGTH = 8
+
+
+def _attempt_password_change(current: str, new: str) -> Optional[str]:
+    """POST /auth/me/password. Returns None on success, else a message.
+
+    A 400 here means the CURRENT password was wrong, and the session is fine -
+    which is why this does not route through bounce_if_unauthorized. Only a
+    real 401 (dead token) should end the session, and the endpoint deliberately
+    does not use 401 for a bad current password.
+    """
+    try:
+        r = requests.post(
+            f"{API_BASE}/auth/me/password",
+            json={"current_password": current, "new_password": new},
+            headers=auth_headers(),
+            timeout=8,
+        )
+    except requests.exceptions.ConnectionError:
+        return f"Cannot reach the API at {API_BASE} — is the backend running?"
+    except requests.exceptions.Timeout:
+        return "The API did not respond in time. Try again."
+    except Exception as exc:
+        return f"Unexpected error contacting the API: {exc}"
+
+    if r.status_code == 200:
+        return None
+    if r.status_code == 401:
+        # The token itself is dead, not the password typed in the form.
+        bounce_if_unauthorized(r)
+        return "Your session has expired."
+    if r.status_code in (400, 422):
+        return _error_detail(r) or "The password could not be changed."
+    return f"Password change failed ({r.status_code})."
+
+
 # ── Screens ───────────────────────────────────────────────────────────────────
 
 def _render_login_screen(expired: bool) -> None:
@@ -371,6 +411,48 @@ def render_sidebar_identity() -> None:
             """,
             unsafe_allow_html=True,
         )
+        # Every page calls render_sidebar_identity() after require_login(), so
+        # putting this here gives all four roles the same control on every
+        # page from one place. Anyone authenticated may change their own
+        # password; there is no role check because there is no role for which
+        # owning your own credential is wrong.
+        with st.expander("🔑 Change password"):
+            with st.form("_auth_change_password", clear_on_submit=False):
+                current_pw = st.text_input(
+                    "Current password", type="password",
+                    autocomplete="current-password", key="_pw_current",
+                )
+                new_pw = st.text_input(
+                    "New password", type="password",
+                    autocomplete="new-password", key="_pw_new",
+                    help=f"At least {MIN_PASSWORD_LENGTH} characters.",
+                )
+                confirm_pw = st.text_input(
+                    "Confirm new password", type="password",
+                    autocomplete="new-password", key="_pw_confirm",
+                )
+                change_submitted = st.form_submit_button(
+                    "Update password", use_container_width=True
+                )
+
+            if change_submitted:
+                if not current_pw or not new_pw or not confirm_pw:
+                    st.error("Fill in all three fields.")
+                elif new_pw != confirm_pw:
+                    st.error("The new passwords do not match.")
+                elif len(new_pw) < MIN_PASSWORD_LENGTH:
+                    st.error(f"Use at least {MIN_PASSWORD_LENGTH} characters.")
+                elif new_pw == current_pw:
+                    st.error("The new password must be different from the current one.")
+                else:
+                    error = _attempt_password_change(current_pw, new_pw)
+                    if error:
+                        st.error(error)
+                    else:
+                        st.success(
+                            "Password updated. Your next sign-in needs the new one."
+                        )
+
         if st.button("Log out", use_container_width=True, key="_auth_logout"):
             logout()
             st.rerun()
