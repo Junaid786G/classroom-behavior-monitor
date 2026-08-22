@@ -29,6 +29,12 @@ other by typing a different code. It is acceptable only while the accounts hold
 nothing a classmate cannot already see, and it is the reason the Phase 2
 change-password endpoint matters more than it looks. Do not extend this pattern
 to staff accounts.
+
+Every account created here is born with must_change_password = TRUE, so the
+shared secret is a first-login credential and nothing more: the holder is
+refused by every gated route until they set their own. 07_force_student_
+password_change.py did the same retrofit for accounts seeded before that
+column existed.
 """
 
 import argparse
@@ -151,8 +157,8 @@ async def seed(conn, password: str) -> tuple:
 
         await conn.execute(text("""
             INSERT INTO users (role, username, password_hash, full_name,
-                               linked_student_id, is_active)
-            VALUES ('STUDENT', :u, :h, :n, :sid, TRUE)
+                               linked_student_id, is_active, must_change_password)
+            VALUES ('STUDENT', :u, :h, :n, :sid, TRUE, TRUE)
         """), {
             "u": code,
             # Hashed per account: bcrypt salts each one, so 14 identical
