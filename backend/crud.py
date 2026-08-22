@@ -266,6 +266,7 @@ async def list_sessions(
     db: AsyncSession,
     classroom_id: Optional[int] = None,
     subject_ids: Optional[List[int]] = None,
+    attended_by_student_id: Optional[int] = None,
     skip: int = 0,
     limit: int = 50,
 ) -> Tuple[int, List[Session]]:
@@ -281,6 +282,17 @@ async def list_sessions(
         q = q.where(Session.classroom_id == classroom_id)
     if subject_ids is not None:
         q = q.where(Session.subject_id.in_(subject_ids))
+    if attended_by_student_id is not None:
+        # A student's own sessions are the ones they were recorded in. Without
+        # this the department's whole timetable - titles, instructors, dates -
+        # is readable by any student who reaches the session list.
+        q = q.where(
+            Session.id.in_(
+                select(AttendanceRecord.session_id).where(
+                    AttendanceRecord.student_id == attended_by_student_id
+                )
+            )
+        )
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar_one()
     rows = (
         await db.execute(q.order_by(Session.created_at.desc()).offset(skip).limit(limit))
@@ -942,6 +954,218 @@ async def get_course_overview(db: AsyncSession, course_id: int) -> Optional[dict
         },
         "behavior_breakdown": breakdown,
         "avg_attention_score": round(avg_attention, 4),
+        "sessions": sessions,
+    }
+
+
+async def get_student_overview(db: AsyncSession, student_id: int) -> Optional[dict]:
+    """One student's attendance and behaviour, by session and by subject.
+
+    Takes a student_id, but the ONLY caller resolves it from the authenticated
+    user's linked_student_id - see the /me/records endpoint. Nothing here
+    should ever be handed an id that came off the wire.
+
+    Returns None when the roster row is gone, so the router can 404 rather
+    than render an empty portal for a deleted student.
+    """
+    student = await get_student(db, student_id)
+    if student is None:
+        return None
+
+    course = await get_course(db, student.course_id) if student.course_id else None
+
+    att_rows = (
+        await db.execute(
+            select(
+                AttendanceRecord.status,
+                AttendanceRecord.confirmed_frame_count,
+                Session.id.label("session_id"),
+                Session.title,
+                Session.instructor,
+                Session.started_at,
+                Session.created_at,
+                Subject.id.label("subject_id"),
+                Subject.subject_code,
+                Subject.subject_name,
+                Subject.is_active.label("subject_is_active"),
+            )
+            .select_from(AttendanceRecord)
+            .join(Session, Session.id == AttendanceRecord.session_id)
+            .join(Subject, Subject.id == Session.subject_id)
+            .where(AttendanceRecord.student_id == student_id)
+            .order_by(func.coalesce(Session.started_at, Session.created_at).desc())
+        )
+    ).all()
+
+    base = {
+        "student_id": student.id,
+        "full_name": student.full_name,
+        "student_code": student.student_code,
+        "course_id": course.id if course else None,
+        "course_code": course.code if course else None,
+        "course_name": course.name if course else None,
+    }
+
+    if not att_rows:
+        return {
+            **base,
+            "attendance": {
+                "sessions": 0, "present": 0, "late": 0, "absent": 0, "excused": 0,
+                "present_rate": 0.0, "late_rate": 0.0, "absent_rate": 0.0,
+            },
+            "behavior_breakdown": [],
+            "attention_score": None,
+            "unattributed_events_in_their_sessions": 0,
+            "subjects": [],
+            "sessions": [],
+        }
+
+    session_ids = [r.session_id for r in att_rows]
+
+    # Their own behaviour, per session and type.
+    beh_rows = (
+        await db.execute(
+            select(
+                BehaviorEvent.session_id,
+                BehaviorEvent.behavior_type,
+                func.count().label("cnt"),
+                func.sum(BehaviorEvent.end_ms - BehaviorEvent.start_ms).label("total_ms"),
+                func.avg(BehaviorEvent.confidence).label("avg_conf"),
+            )
+            .where(
+                BehaviorEvent.session_id.in_(session_ids),
+                BehaviorEvent.student_id == student_id,
+            )
+            .group_by(BehaviorEvent.session_id, BehaviorEvent.behavior_type)
+        )
+    ).all()
+
+    # Events in the same sessions that the pipeline could not attribute to
+    # anyone. Reported as a count only - they are nobody's record, and leaving
+    # them out silently would make the percentages look like a share of the
+    # whole room.
+    unattributed = (
+        await db.execute(
+            select(func.count())
+            .select_from(BehaviorEvent)
+            .where(
+                BehaviorEvent.session_id.in_(session_ids),
+                BehaviorEvent.student_id.is_(None),
+            )
+        )
+    ).scalar_one()
+
+    beh_by_session: Dict[UUID, list] = {}
+    for r in beh_rows:
+        beh_by_session.setdefault(r.session_id, []).append(r)
+
+    attentive_types = (BehaviorType.ATTENTIVE, BehaviorType.RAISED_HAND)
+
+    def _attention(events) -> Optional[float]:
+        total = sum(e.cnt for e in events)
+        if not total:
+            return None
+        return round(
+            sum(e.cnt for e in events if e.behavior_type in attentive_types) / total, 4
+        )
+
+    status_totals = {s: 0 for s in AttendanceStatus}
+    per_subject: Dict[int, dict] = {}
+    overall_beh: Dict[BehaviorType, dict] = {}
+    sessions: List[dict] = []
+
+    for r in att_rows:
+        status_totals[r.status] = status_totals.get(r.status, 0) + 1
+        events = beh_by_session.get(r.session_id, [])
+
+        subj = per_subject.setdefault(r.subject_id, {
+            "subject_id": r.subject_id,
+            "subject_code": r.subject_code,
+            "subject_name": r.subject_name,
+            "subject_is_active": r.subject_is_active,
+            "sessions": 0,
+            "present": 0, "late": 0, "absent": 0, "excused": 0,
+            "_events": [],
+        })
+        subj["sessions"] += 1
+        subj[r.status.value] = subj.get(r.status.value, 0) + 1
+        subj["_events"].extend(events)
+
+        for e in events:
+            agg = overall_beh.setdefault(
+                e.behavior_type,
+                {"count": 0, "total_duration_ms": 0, "conf_weighted": 0.0},
+            )
+            agg["count"] += e.cnt
+            agg["total_duration_ms"] += int(e.total_ms or 0)
+            agg["conf_weighted"] += float(e.avg_conf or 0.0) * e.cnt
+
+        sessions.append({
+            "session_id": r.session_id,
+            "subject_id": r.subject_id,
+            "subject_code": r.subject_code,
+            "subject_name": r.subject_name,
+            "subject_is_active": r.subject_is_active,
+            "title": r.title,
+            "instructor": r.instructor,
+            "started_at": r.started_at,
+            "status": r.status,
+            "confirmed_frame_count": r.confirmed_frame_count,
+            "behavior_counts": {e.behavior_type.value: e.cnt for e in events},
+            "attention_score": _attention(events),
+        })
+
+    total_sessions = len(att_rows)
+    present = status_totals.get(AttendanceStatus.PRESENT, 0)
+    late = status_totals.get(AttendanceStatus.LATE, 0)
+    absent = status_totals.get(AttendanceStatus.ABSENT, 0)
+    excused = status_totals.get(AttendanceStatus.EXCUSED, 0)
+
+    subjects = []
+    for subj in per_subject.values():
+        events = subj.pop("_events")
+        counted = subj["present"] + subj["late"] + subj["absent"] + subj["excused"]
+        subj["attendance_rate"] = (
+            round((subj["present"] + subj["late"]) / counted, 4) if counted else 0.0
+        )
+        subj["attention_score"] = _attention(events)
+        subjects.append(subj)
+    subjects.sort(key=lambda x: (not x["subject_is_active"], x["subject_code"]))
+
+    total_events = sum(a["count"] for a in overall_beh.values())
+    breakdown = [
+        {
+            "behavior_type": bt,
+            "count": agg["count"],
+            "total_duration_ms": agg["total_duration_ms"],
+            "avg_confidence": round(agg["conf_weighted"] / agg["count"], 4),
+            "percentage": round(agg["count"] / total_events * 100, 2),
+        }
+        for bt, agg in sorted(overall_beh.items(), key=lambda kv: -kv[1]["count"])
+    ] if total_events else []
+
+    attention = (
+        round(
+            sum(a["count"] for bt, a in overall_beh.items() if bt in attentive_types)
+            / total_events,
+            4,
+        )
+        if total_events else None
+    )
+
+    return {
+        **base,
+        "attendance": {
+            "sessions": total_sessions,
+            "present": present, "late": late, "absent": absent, "excused": excused,
+            "present_rate": round(present / total_sessions, 4),
+            "late_rate": round(late / total_sessions, 4),
+            "absent_rate": round(absent / total_sessions, 4),
+        },
+        "behavior_breakdown": breakdown,
+        "attention_score": attention,
+        "unattributed_events_in_their_sessions": unattributed,
+        "subjects": subjects,
         "sessions": sessions,
     }
 

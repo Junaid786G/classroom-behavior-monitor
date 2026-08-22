@@ -7,7 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend import crud
 from backend.database import get_db
-from backend.deps import require_hod, require_instructor, require_session_access
+from backend.models import User
+from backend.deps import (
+    require_hod,
+    require_instructor,
+    require_session_access,
+    require_student,
+)
 from backend.schemas import (
     AlertAcknowledge,
     AlertOut,
@@ -17,6 +23,7 @@ from backend.schemas import (
     CourseOverview,
     Page,
     SessionAnalytics,
+    StudentOverview,
 )
 
 router = APIRouter(tags=["analytics"])
@@ -47,6 +54,38 @@ async def course_overview(
     if data is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Course not found")
     return CourseOverview(**data)
+
+
+# ── A student's own record ────────────────────────────────────────────────────
+
+# There is no student_id in this route, by design. Every other scoped endpoint
+# validates an id the caller supplied - require_session_access and
+# require_student_access both work that way - but a student portal has exactly
+# one legitimate subject, so the id is read off the authenticated user instead
+# of being accepted and checked. Nothing on the wire can point it elsewhere.
+@router.get("/me/records", response_model=StudentOverview)
+async def my_records(
+    user: User = Depends(require_student),
+    db: AsyncSession = Depends(get_db),
+):
+    """The signed-in student's own attendance and behaviour.
+
+    linked_student_id comes from the users row get_current_user reloaded on
+    this request, not from the token's student_id claim: a claim is a snapshot,
+    and unlinking or deactivating an account must take effect immediately.
+    """
+    if user.linked_student_id is None:
+        # ck_users_student_link makes this unreachable for a STUDENT row, so
+        # if it ever fires the constraint has been dropped or bypassed.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This student login is not linked to a roster row",
+        )
+
+    data = await crud.get_student_overview(db, user.linked_student_id)
+    if data is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student record not found")
+    return StudentOverview(**data)
 
 
 # ── Session analytics ─────────────────────────────────────────────────────────

@@ -375,6 +375,74 @@ class CourseOverview(BaseModel):
     sessions: List[CourseSessionRow]
 
 
+class StudentSessionRow(BaseModel):
+    """One session this student was recorded in."""
+    session_id: UUID
+    subject_id: int
+    subject_code: str
+    subject_name: str
+    subject_is_active: bool
+    title: Optional[str] = None
+    instructor: Optional[str] = None
+    started_at: Optional[datetime] = None
+    status: AttendanceStatus
+    confirmed_frame_count: int
+    behavior_counts: Dict[str, int] = {}
+    attention_score: Optional[float] = None
+
+
+class StudentSubjectRow(BaseModel):
+    """This student's record within one subject."""
+    subject_id: int
+    subject_code: str
+    subject_name: str
+    subject_is_active: bool
+    sessions: int
+    present: int
+    late: int
+    absent: int
+    excused: int
+    attendance_rate: float
+    attention_score: Optional[float] = None
+
+
+class StudentAttendanceRollup(BaseModel):
+    """Every session this student has an attendance row for.
+
+    Counted straight from the rows: a student has exactly one record per
+    session, so unlike the course roll-up there is no roster arithmetic and
+    nothing to infer. `sessions` is how many they were recorded in, not how
+    many the course held.
+    """
+    sessions: int
+    present: int
+    late: int
+    absent: int
+    excused: int
+    present_rate: float
+    late_rate: float
+    absent_rate: float
+
+
+class StudentOverview(BaseModel):
+    """One student's own record. Never addressed by id - see the endpoint."""
+    student_id: int
+    full_name: str
+    student_code: Optional[str] = None
+    course_id: Optional[int] = None
+    course_code: Optional[str] = None
+    course_name: Optional[str] = None
+    attendance: StudentAttendanceRollup
+    behavior_breakdown: List[BehaviorBreakdownItem]
+    attention_score: Optional[float] = None
+    # Behaviour events the pipeline could not attribute to any student. Shown
+    # so the percentages below are not read as a share of everything that
+    # happened in the room.
+    unattributed_events_in_their_sessions: int
+    subjects: List[StudentSubjectRow]
+    sessions: List[StudentSessionRow]
+
+
 class AttendanceTrend(BaseModel):
     date: str
     present: int

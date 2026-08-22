@@ -103,8 +103,19 @@ async def list_sessions(
         if user.role is UserRole.INSTRUCTOR
         else None
     )
+    # A STUDENT sees the sessions they were recorded in, and nothing else. The
+    # Home page shows this list to every role, so without this a student reads
+    # the department's timetable - titles, instructors, dates.
+    attended_by = (
+        user.linked_student_id if user.role is UserRole.STUDENT else None
+    )
     total, rows = await crud.list_sessions(
-        db, classroom_id=classroom_id, subject_ids=subject_ids, skip=skip, limit=limit
+        db,
+        classroom_id=classroom_id,
+        subject_ids=subject_ids,
+        attended_by_student_id=attended_by,
+        skip=skip,
+        limit=limit,
     )
     return Page(total=total, skip=skip, limit=limit, items=[SessionOut.model_validate(r) for r in rows])
 
