@@ -20,7 +20,13 @@ import requests
 import streamlit as st
 from PIL import Image
 
-from auth import render_sidebar_identity, require_login
+from auth import (
+    auth_headers,
+    bounce_if_unauthorized,
+    cache_user_id,
+    render_sidebar_identity,
+    require_login,
+)
 from permissions import PAGE_LIVE_MONITOR, require_page_access
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -61,7 +67,9 @@ _SKIP_FRAMES = 24  # process every 25th frame (~1 fps at 25 fps)
 
 def _get(path: str, **kw) -> Optional[dict]:
     try:
-        r = requests.get(f"{API_BASE}{path}", timeout=5, **kw)
+        r = requests.get(f"{API_BASE}{path}", timeout=5,
+                         headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
         return r.json() if r.ok else None
     except Exception:
         return None
@@ -69,32 +77,37 @@ def _get(path: str, **kw) -> Optional[dict]:
 
 def _post(path: str, **kw) -> Optional[dict]:
     try:
-        r = requests.post(f"{API_BASE}{path}", timeout=10, **kw)
+        r = requests.post(f"{API_BASE}{path}", timeout=10,
+                         headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
         return r.json() if r.ok else None
     except Exception:
         return None
 
 
+# user_id is unused in the bodies below and deliberately so: it puts the
+# caller's identity into st.cache_data's key. The cache is process-wide
+# across browser sessions, and the API scopes its answers per role.
 @st.cache_data(ttl=10)
-def _list_classrooms():
+def _list_classrooms(user_id: int):
     data = _get("/classrooms") or {}
     return data.get("items", [])
 
 
 @st.cache_data(ttl=10)
-def _list_courses():
+def _list_courses(user_id: int):
     data = _get("/courses") or {}
     return data.get("items", [])
 
 
 @st.cache_data(ttl=10)
-def _list_subjects(course_id: int):
+def _list_subjects(user_id: int, course_id: int):
     data = _get(f"/courses/{course_id}/subjects") or {}
     return data.get("items", [])
 
 
 @st.cache_data(ttl=5)
-def _list_sessions(classroom_id=None):
+def _list_sessions(user_id: int, classroom_id=None):
     params = {"limit": 30}
     if classroom_id:
         params["classroom_id"] = classroom_id
@@ -111,9 +124,14 @@ class _WSMonitor:
     via get_result().  Created once per session and stored in session_state.
     """
 
-    def __init__(self, session_id: str, send_annotated: bool = True, source_fps: float = 0.0):
+    def __init__(self, session_id: str, send_annotated: bool = True, source_fps: float = 0.0,
+                 auth_header: Optional[dict] = None):
         self.session_id = session_id
         self.send_annotated = send_annotated
+        # Captured on the main thread and carried, rather than read at connect
+        # time: everything below runs on a background thread, where
+        # st.session_state - which auth_headers() reads - is not available.
+        self._auth_header = auth_header or {}
         # Declared to the server so it can reconstruct real video time: we send
         # every (_SKIP_FRAMES + 1)th frame, not consecutive ones.
         self.source_fps = source_fps
@@ -138,7 +156,15 @@ class _WSMonitor:
         )
         try:
             self._ws = websocket.WebSocket()
-            self._ws.connect(url, timeout=8)
+            # The token rides in the handshake header rather than the query
+            # string, so it stays out of access logs and proxy history. The WS
+            # route is INSTRUCTOR-only; without this the server closes with
+            # 1008 before the first frame.
+            self._ws.connect(
+                url,
+                timeout=8,
+                header=[f"{k}: {v}" for k, v in self._auth_header.items()],
+            )
             self._connected = True
             return True
         except Exception as exc:
@@ -213,7 +239,7 @@ _init_state()
 with st.sidebar:
     st.markdown('<p class="section-label">▸ Session Control</p>', unsafe_allow_html=True)
 
-    classrooms = _list_classrooms()
+    classrooms = _list_classrooms(cache_user_id())
     classroom_id = None
     if not classrooms:
         st.warning("No classrooms found – is the backend running and migrated?")
@@ -224,7 +250,7 @@ with st.sidebar:
 
     # Course → subject. A session is scoped by its subject, which implies the
     # course; the classroom above is only the physical room / camera.
-    courses = _list_courses()
+    courses = _list_courses(cache_user_id())
     subject_id = None
     subject_label = ""
     if not courses:
@@ -234,7 +260,7 @@ with st.sidebar:
         chosen_course = st.selectbox("Course", list(course_names.keys()), key="course_sel")
         course_code = chosen_course.split(" — ", 1)[0]
 
-        subjects = _list_subjects(course_names[chosen_course])
+        subjects = _list_subjects(cache_user_id(), course_names[chosen_course])
         if not subjects:
             st.warning(
                 f"No subjects defined for {course_code} yet. Add one with:\n\n"
@@ -289,7 +315,7 @@ with st.sidebar:
 
     st.divider()
     st.markdown('<p class="section-label">▸ Existing Session</p>', unsafe_allow_html=True)
-    sessions = _list_sessions(classroom_id)
+    sessions = _list_sessions(cache_user_id(), classroom_id)
     if sessions:
         session_opts = {
             f"{s.get('title') or s.get('subject','?')} [{s['status']}]": s["id"]
@@ -357,6 +383,7 @@ with video_col:
             st.session_state.session_id,
             send_annotated=True,
             source_fps=st.session_state.get("source_fps", 0.0),
+            auth_header=auth_headers(),
         )
         ok = monitor.connect()
         if ok:

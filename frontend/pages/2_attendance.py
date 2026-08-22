@@ -12,7 +12,14 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-from auth import current_role, render_sidebar_identity, require_login
+from auth import (
+    auth_headers,
+    bounce_if_unauthorized,
+    cache_user_id,
+    current_role,
+    render_sidebar_identity,
+    require_login,
+)
 from permissions import PAGE_ATTENDANCE, can_write_attendance, require_page_access
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -55,7 +62,9 @@ def _dark_layout(**kw) -> dict:
 
 def _get(path: str, **kw):
     try:
-        r = requests.get(f"{API_BASE}{path}", timeout=6, **kw)
+        r = requests.get(f"{API_BASE}{path}", timeout=6,
+                         headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
         return r.json() if r.ok else None
     except Exception:
         return None
@@ -63,14 +72,19 @@ def _get(path: str, **kw):
 
 def _patch(path: str, **kw):
     try:
-        r = requests.patch(f"{API_BASE}{path}", timeout=6, **kw)
+        r = requests.patch(f"{API_BASE}{path}", timeout=6,
+                         headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
         return r.json() if r.ok else None
     except Exception:
         return None
 
 
+# user_id is unused in the bodies below and deliberately so: it puts the
+# caller's identity into st.cache_data's key. The cache is process-wide
+# across browser sessions, and the API scopes its answers per role.
 @st.cache_data(ttl=10)
-def _sessions(classroom_id=None):
+def _sessions(user_id: int, classroom_id=None):
     p = {"limit": 50}
     if classroom_id:
         p["classroom_id"] = classroom_id
@@ -79,19 +93,21 @@ def _sessions(classroom_id=None):
 
 
 @st.cache_data(ttl=8)
-def _attendance(session_id: str):
+def _attendance(user_id: int, session_id: str):
     d = _get(f"/sessions/{session_id}/attendance", params={"include_student": "true"}) or {}
     return d.get("items", [])
 
 
 @st.cache_data(ttl=8)
-def _summary(session_id: str):
+def _summary(user_id: int, session_id: str):
     return _get(f"/sessions/{session_id}/attendance/summary") or {}
 
 
 def _export_csv(session_id: str) -> Optional[bytes]:
     try:
-        r = requests.get(f"{API_BASE}/sessions/{session_id}/attendance/export", timeout=10)
+        r = requests.get(f"{API_BASE}/sessions/{session_id}/attendance/export",
+                         headers=auth_headers(), timeout=10)
+        bounce_if_unauthorized(r)
         return r.content if r.ok else None
     except Exception:
         return None
@@ -100,7 +116,7 @@ def _export_csv(session_id: str) -> Optional[bytes]:
 # ── Sidebar – session selector ────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<p class="section-label">▸ Session Filter</p>', unsafe_allow_html=True)
-    sessions = _sessions()
+    sessions = _sessions(cache_user_id())
 
     if not sessions:
         st.warning("No sessions found.\nProcess a video first.")
@@ -137,7 +153,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Summary metrics ───────────────────────────────────────────────────────────
-summary = _summary(session_id)
+summary = _summary(cache_user_id(), session_id)
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Enrolled",  summary.get("total_enrolled", "—"))
 c2.metric("Present",   summary.get("present", "—"))
@@ -153,7 +169,7 @@ table_col, chart_col = st.columns([3, 2], gap="large")
 
 with table_col:
     st.markdown('<p class="section-label">▸ Attendance Table</p>', unsafe_allow_html=True)
-    records = _attendance(session_id)
+    records = _attendance(cache_user_id(), session_id)
 
     if records:
         rows = []

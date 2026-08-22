@@ -12,7 +12,13 @@ from typing import Optional
 import requests
 import streamlit as st
 
-from auth import render_sidebar_identity, require_login
+from auth import (
+    auth_headers,
+    bounce_if_unauthorized,
+    cache_user_id,
+    render_sidebar_identity,
+    require_login,
+)
 from permissions import PAGE_ADMIN, require_page_access
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -37,7 +43,9 @@ API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000/api/v1")
 
 def _get(path, **kw):
     try:
-        r = requests.get(f"{API_BASE}{path}", timeout=6, **kw)
+        r = requests.get(f"{API_BASE}{path}", timeout=6,
+                         headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
         return r.json() if r.ok else None
     except Exception as e:
         return None
@@ -45,7 +53,9 @@ def _get(path, **kw):
 
 def _post(path, **kw):
     try:
-        r = requests.post(f"{API_BASE}{path}", timeout=30, **kw)
+        r = requests.post(f"{API_BASE}{path}", timeout=30,
+                         headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
         return r.json() if r.ok else None
     except Exception:
         return None
@@ -53,7 +63,9 @@ def _post(path, **kw):
 
 def _patch(path, **kw):
     try:
-        r = requests.patch(f"{API_BASE}{path}", timeout=10, **kw)
+        r = requests.patch(f"{API_BASE}{path}", timeout=10,
+                         headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
         return r.json() if r.ok else None
     except Exception:
         return None
@@ -61,7 +73,9 @@ def _patch(path, **kw):
 
 def _delete(path, **kw):
     try:
-        r = requests.delete(f"{API_BASE}{path}", timeout=6, **kw)
+        r = requests.delete(f"{API_BASE}{path}", timeout=6,
+                         headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
         return r.status_code in (200, 204)
     except Exception:
         return False
@@ -103,14 +117,17 @@ def _save_env(updates: dict) -> None:
     ENV_PATH.write_text("\n".join(lines) + "\n")
 
 
+# user_id is unused in the bodies below and deliberately so: it puts the
+# caller's identity into st.cache_data's key. The cache is process-wide
+# across browser sessions, and the API scopes its answers per role.
 @st.cache_data(ttl=8)
-def _students():
+def _students(user_id: int):
     d = _get("/students", params={"limit": 200, "active_only": "false"}) or {}
     return d.get("items", [])
 
 
 @st.cache_data(ttl=15)
-def _classrooms():
+def _classrooms(user_id: int):
     d = _get("/classrooms") or {}
     return d.get("items", [])
 
@@ -153,7 +170,7 @@ with tab_students:
     with left:
         st.markdown('<p class="section-label">▸ Add New Student</p>', unsafe_allow_html=True)
 
-        classrooms = _classrooms()
+        classrooms = _classrooms(cache_user_id())
         cls_map = {c["name"]: c["id"] for c in classrooms} if classrooms else {"Default": 1}
 
         with st.form("add_student_form", clear_on_submit=True):
@@ -183,7 +200,7 @@ with tab_students:
         st.divider()
         st.markdown('<p class="section-label">▸ Upload Photo</p>', unsafe_allow_html=True)
 
-        students = _students()
+        students = _students(cache_user_id())
         if students:
             stu_map = {f"{s['student_code']}  {s['full_name']}": s["id"] for s in students}
             chosen   = st.selectbox("Student", list(stu_map.keys()), key="photo_stu")
@@ -203,7 +220,7 @@ with tab_students:
 
     with right:
         st.markdown('<p class="section-label">▸ Student Roster</p>', unsafe_allow_html=True)
-        students = _students()
+        students = _students(cache_user_id())
 
         if students:
             import pandas as pd
@@ -275,7 +292,7 @@ with tab_enroll:
         unsafe_allow_html=True,
     )
 
-    students = _students()
+    students = _students(cache_user_id())
     if not students:
         st.warning("Register students first (Students tab).")
     else:
@@ -430,7 +447,7 @@ with tab_gallery:
 
     with col_g2:
         st.markdown('<p class="section-label">▸ Embedding Coverage</p>', unsafe_allow_html=True)
-        students = _students()
+        students = _students(cache_user_id())
         if students:
             import pandas as pd
             rows = [
@@ -483,7 +500,7 @@ with tab_classrooms:
 
     with c_right:
         st.markdown('<p class="section-label">▸ Classrooms</p>', unsafe_allow_html=True)
-        classrooms = _classrooms()
+        classrooms = _classrooms(cache_user_id())
         if classrooms:
             import pandas as pd
             rows = [

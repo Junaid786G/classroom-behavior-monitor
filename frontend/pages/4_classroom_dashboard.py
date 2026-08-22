@@ -13,7 +13,13 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-from auth import render_sidebar_identity, require_login
+from auth import (
+    auth_headers,
+    bounce_if_unauthorized,
+    cache_user_id,
+    render_sidebar_identity,
+    require_login,
+)
 from permissions import PAGE_CLASSROOM_DASHBOARD, require_page_access
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -68,20 +74,25 @@ def _layout(**kw):
 
 def _get(path, **kw):
     try:
-        r = requests.get(f"{API_BASE}{path}", timeout=6, **kw)
+        r = requests.get(f"{API_BASE}{path}", timeout=6,
+                         headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
         return r.json() if r.ok else None
     except Exception:
         return None
 
 
+# user_id is unused in the bodies below and deliberately so: it puts the
+# caller's identity into st.cache_data's key. The cache is process-wide
+# across browser sessions, and the API scopes its answers per role.
 @st.cache_data(ttl=15)
-def _classrooms():
+def _classrooms(user_id: int):
     d = _get("/classrooms") or {}
     return d.get("items", [])
 
 
 @st.cache_data(ttl=10)
-def _sessions(classroom_id=None):
+def _sessions(user_id: int, classroom_id=None):
     p = {"limit": 200}
     if classroom_id:
         p["classroom_id"] = classroom_id
@@ -90,12 +101,12 @@ def _sessions(classroom_id=None):
 
 
 @st.cache_data(ttl=10)
-def _session_analytics(session_id: str):
+def _session_analytics(user_id: int, session_id: str):
     return _get(f"/sessions/{session_id}/analytics")
 
 
 @st.cache_data(ttl=10)
-def _attendance_summary(session_id: str):
+def _attendance_summary(user_id: int, session_id: str):
     return _get(f"/sessions/{session_id}/attendance/summary")
 
 
@@ -113,7 +124,7 @@ def _session_date(s):
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<p class="section-label">▸ Classroom</p>', unsafe_allow_html=True)
-    classrooms = _classrooms()
+    classrooms = _classrooms(cache_user_id())
     if not classrooms:
         st.warning("No classrooms registered yet.\nGo to **Admin** to create one.")
         st.stop()
@@ -150,7 +161,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── Gather + aggregate all sessions for this classroom ────────────────────────
-all_sessions = _sessions(classroom_id)
+all_sessions = _sessions(cache_user_id(), classroom_id)
 # defensive client-side filter (API already filters, but the task calls for it)
 sessions = [s for s in all_sessions if s.get("classroom_id") == classroom_id]
 sessions.sort(key=lambda s: (_session_date(s) or pd.Timestamp.min))
@@ -173,8 +184,8 @@ rate_count = 0
 with st.spinner("Aggregating session analytics…"):
     for s in sessions:
         sid = s["id"]
-        summ = _attendance_summary(sid) or {}
-        ana = _session_analytics(sid) or {}
+        summ = _attendance_summary(cache_user_id(), sid) or {}
+        ana = _session_analytics(cache_user_id(), sid) or {}
 
         present = summ.get("present", 0)
         absent  = summ.get("absent", 0)
@@ -235,14 +246,21 @@ with col_a:
         ]).sort_values("Date")
 
         fig_line = go.Figure()
+        # .tolist() rather than the Series: plotly's pandas path chokes on a
+        # SINGLE-row tz-aware datetime column (SystemError out of pandas'
+        # checknull) on plotly 6.8 / pandas 3.0, though not on the versions
+        # Dockerfile.frontend pins. One row is now an ordinary state - an
+        # instructor scoped to one assigned subject sees exactly one session -
+        # so the chart should not depend on which pandas happens to be
+        # installed.
         fig_line.add_trace(go.Scatter(
-            x=trend_df["Date"], y=trend_df["Attendance Rate"],
+            x=trend_df["Date"].tolist(), y=trend_df["Attendance Rate"].tolist(),
             mode="lines+markers",
             line=dict(color=_GUNMETAL, width=2),
             marker=dict(size=6, color=_OLIVE),
             fill="tozeroy",
             fillcolor="rgba(46,61,80,0.08)",
-            customdata=trend_df["Subject"],
+            customdata=trend_df["Subject"].tolist(),
             hovertemplate="%{x|%Y-%m-%d}<br>%{customdata}<br>Rate: %{y:.0%}<extra></extra>",
             name="Attendance",
         ))

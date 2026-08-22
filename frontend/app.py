@@ -9,7 +9,13 @@ from pathlib import Path
 import requests
 import streamlit as st
 
-from auth import render_sidebar_identity, require_login
+from auth import (
+    auth_headers,
+    bounce_if_unauthorized,
+    cache_user_id,
+    render_sidebar_identity,
+    require_login,
+)
 from permissions import (
     PAGE_ADMIN,
     PAGE_ATTENDANCE,
@@ -67,20 +73,27 @@ def _health() -> dict:
     except Exception:
         return {}
 
+# user_id is unused inside these, and deliberately so: it is here to put the
+# caller's identity into st.cache_data's key. The cache is process-wide across
+# browser sessions, and the API now scopes its answers per role.
 @st.cache_data(ttl=10)
-def _recent_sessions(limit: int = 8) -> list:
+def _recent_sessions(user_id: int, limit: int = 8) -> list:
     try:
-        r = requests.get(f"{API_BASE}/sessions", params={"limit": limit}, timeout=4)
+        r = requests.get(f"{API_BASE}/sessions", params={"limit": limit},
+                         headers=auth_headers(), timeout=4)
+        bounce_if_unauthorized(r)
         return r.json().get("items", []) if r.ok else []
     except Exception:
         return []
 
 @st.cache_data(ttl=15)
-def _session_summary(session_id: str, classroom_id: int) -> dict:
+def _session_summary(user_id: int, session_id: str, classroom_id: int) -> dict:
     try:
         r = requests.get(
-            f"{API_BASE}/sessions/{session_id}/attendance/summary", timeout=3
+            f"{API_BASE}/sessions/{session_id}/attendance/summary",
+            headers=auth_headers(), timeout=3,
         )
+        bounce_if_unauthorized(r)
         return r.json() if r.ok else {}
     except Exception:
         return {}
@@ -114,7 +127,7 @@ left, right = st.columns([3, 2], gap="large")
 with left:
     st.markdown('<p class="section-label">▸ Recent Sessions</p>', unsafe_allow_html=True)
 
-    sessions = _recent_sessions()
+    sessions = _recent_sessions(cache_user_id())
     if sessions:
         rows = []
         for s in sessions:

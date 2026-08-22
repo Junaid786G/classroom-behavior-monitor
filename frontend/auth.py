@@ -40,7 +40,11 @@ API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000/api/v1")
 _TOKEN_KEY = "token"
 _USER_KEY = "user"
 _EXPIRES_KEY = "token_expires_at"
-_AUTH_KEYS = (_TOKEN_KEY, _USER_KEY, _EXPIRES_KEY)
+# Set when the API answers 401, so the login screen can say why it reappeared.
+# In _AUTH_KEYS so an ordinary logout clears any stale flag; bounce_if_
+# unauthorized() sets it *after* calling logout(), which is what makes it stick.
+_REJECTED_KEY = "token_rejected"
+_AUTH_KEYS = (_TOKEN_KEY, _USER_KEY, _EXPIRES_KEY, _REJECTED_KEY)
 
 # The API speaks lowercase role values; these are what a human should read.
 _ROLE_LABEL = {
@@ -72,6 +76,45 @@ def auth_headers() -> dict:
     """
     token = st.session_state.get(_TOKEN_KEY)
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def bounce_if_unauthorized(response) -> None:
+    """Drop the credentials and redraw the login screen if the API said 401.
+
+    Every page's request helper calls this. A 401 means the token is missing,
+    malformed or expired; nothing the current page can do with that, so the
+    credentials go and the script reruns into the login screen.
+
+    A 403 is deliberately NOT handled here. That is an authenticated user
+    reaching for a role they do not hold — logging them out would not fix it,
+    and would turn a wrong link into a mysterious logout. The caller gets its
+    usual None and the page shows its empty state.
+
+    Does not return on 401: st.rerun() raises RerunException, which subclasses
+    BaseException, so the `except Exception` in the calling helpers cannot
+    swallow it.
+    """
+    if response.status_code != 401:
+        return
+    logout()
+    st.session_state[_REJECTED_KEY] = True
+    st.rerun()
+
+
+def cache_user_id() -> int:
+    """Identity to thread into every @st.cache_data key that holds API data.
+
+    st.cache_data is process-wide and shared by every browser session on this
+    server. Now that the API scopes responses by role, a cache keyed only on
+    the query arguments would hand one user another user's rows — an HOD's
+    session list served to an instructor, or the reverse.
+
+    Pass this as a normal argument, never as one named with a leading
+    underscore: Streamlit excludes underscore-prefixed parameters from the
+    hash, which would put the identity in the signature but not in the key.
+    """
+    user = current_user()
+    return int(user["id"]) if user else 0
 
 
 def is_authenticated() -> bool:
@@ -298,6 +341,9 @@ def require_login() -> dict:
     expired = had_token and not is_authenticated()
     if expired:
         logout()
+    # A 401 from the API counts as expired too: bounce_if_unauthorized() has
+    # already cleared the credentials, and this is where the user is told why.
+    expired = st.session_state.pop(_REJECTED_KEY, False) or expired
 
     if not is_authenticated():
         _render_login_screen(expired=expired)   # calls st.stop()

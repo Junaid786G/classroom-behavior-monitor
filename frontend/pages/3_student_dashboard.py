@@ -12,7 +12,13 @@ from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 
-from auth import render_sidebar_identity, require_login
+from auth import (
+    auth_headers,
+    bounce_if_unauthorized,
+    cache_user_id,
+    render_sidebar_identity,
+    require_login,
+)
 from permissions import PAGE_STUDENT_DASHBOARD, require_page_access
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -62,14 +68,19 @@ def _layout(**kw):
 
 def _get(path, **kw):
     try:
-        r = requests.get(f"{API_BASE}{path}", timeout=6, **kw)
+        r = requests.get(f"{API_BASE}{path}", timeout=6,
+                         headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
         return r.json() if r.ok else None
     except Exception:
         return None
 
 
+# user_id is unused in the bodies below and deliberately so: it puts the
+# caller's identity into st.cache_data's key. The cache is process-wide
+# across browser sessions, and the API scopes its answers per role.
 @st.cache_data(ttl=15)
-def _students(classroom_id=None):
+def _students(user_id: int, classroom_id=None):
     p = {"limit": 200, "active_only": "true"}
     if classroom_id:
         p["classroom_id"] = classroom_id
@@ -78,7 +89,7 @@ def _students(classroom_id=None):
 
 
 @st.cache_data(ttl=10)
-def _sessions(classroom_id=None):
+def _sessions(user_id: int, classroom_id=None):
     p = {"limit": 50}
     if classroom_id:
         p["classroom_id"] = classroom_id
@@ -87,18 +98,18 @@ def _sessions(classroom_id=None):
 
 
 @st.cache_data(ttl=10)
-def _student_attendance(student_id: int):
+def _student_attendance(user_id: int, student_id: int):
     d = _get(f"/students/{student_id}/attendance", params={"limit": 100}) or {}
     return d.get("items", [])
 
 
 @st.cache_data(ttl=10)
-def _session_analytics(session_id: str):
+def _session_analytics(user_id: int, session_id: str):
     return _get(f"/sessions/{session_id}/analytics")
 
 
 @st.cache_data(ttl=10)
-def _behavior_events(session_id: str, student_id: int):
+def _behavior_events(user_id: int, session_id: str, student_id: int):
     d = _get(
         f"/sessions/{session_id}/behavior",
         params={"student_id": student_id, "limit": 500},
@@ -107,7 +118,7 @@ def _behavior_events(session_id: str, student_id: int):
 
 
 @st.cache_data(ttl=10)
-def _timeline(session_id: str):
+def _timeline(user_id: int, session_id: str):
     d = _get(f"/sessions/{session_id}/behavior/timeline", params={"bucket_ms": 5000}) or {}
     return d.get("timeline", [])
 
@@ -115,7 +126,7 @@ def _timeline(session_id: str):
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<p class="section-label">▸ Student</p>', unsafe_allow_html=True)
-    students = _students()
+    students = _students(cache_user_id())
     if not students:
         st.warning("No students enrolled yet.\nGo to **Admin** to register students.")
         st.stop()
@@ -126,7 +137,7 @@ with st.sidebar:
 
     st.divider()
     st.markdown('<p class="section-label">▸ Session</p>', unsafe_allow_html=True)
-    sessions = _sessions()
+    sessions = _sessions(cache_user_id())
     completed = [s for s in sessions if s.get("status") == "completed"]
     if completed:
         sess_map = {
@@ -156,7 +167,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── Attendance overview ───────────────────────────────────────────────────────
-att_records = _student_attendance(student_id)
+att_records = _student_attendance(cache_user_id(), student_id)
 total_sessions = len(att_records)
 present_count  = sum(1 for r in att_records if r.get("status") in ("present", "late"))
 late_count     = sum(1 for r in att_records if r.get("status") == "late")
@@ -184,7 +195,7 @@ with col_a:
     st.markdown('<p class="section-label">▸ Behaviour Breakdown</p>', unsafe_allow_html=True)
 
     if session_id:
-        events = _behavior_events(session_id, student_id)
+        events = _behavior_events(cache_user_id(), session_id, student_id)
         if events:
             from collections import Counter
             counts = Counter(e["behavior_type"] for e in events)
@@ -261,7 +272,7 @@ with col_b:
     st.markdown('<p class="section-label">▸ Attention Timeline</p>', unsafe_allow_html=True)
 
     if session_id:
-        timeline = _timeline(session_id)
+        timeline = _timeline(cache_user_id(), session_id)
         if timeline:
             times_min  = [t["time_ms"] / 60_000 for t in timeline]
             attn_scores = [t["attention_score"] for t in timeline]
@@ -298,7 +309,7 @@ with col_b:
 
         # ── Session analytics breakdown table ─────────────────────────────────
         st.markdown('<p class="section-label">▸ Session Analytics</p>', unsafe_allow_html=True)
-        analytics = _session_analytics(session_id)
+        analytics = _session_analytics(cache_user_id(), session_id)
         if analytics and analytics.get("behavior_breakdown"):
             bd = analytics["behavior_breakdown"]
             rows = []
@@ -329,7 +340,7 @@ with col_b:
 
     if att_records and session_id:
         # For demo: show the events for the current session as a timeline bar
-        events = _behavior_events(session_id, student_id)
+        events = _behavior_events(cache_user_id(), session_id, student_id)
         if events:
             df_ev = pd.DataFrame([
                 {
@@ -366,7 +377,7 @@ with col_b:
                 st.markdown('<p class="section-label">▸ Class Leaderboard</p>', unsafe_allow_html=True)
                 leaderboard_rows = []
                 for s in students:
-                    s_events = _behavior_events(session_id, s["id"])
+                    s_events = _behavior_events(cache_user_id(), session_id, s["id"])
                     if not s_events:
                         continue
                     total = len(s_events)
