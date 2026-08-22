@@ -27,12 +27,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend import crud
 from backend.config import get_settings
 from backend.database import AsyncSessionLocal, get_db
+from backend.deps import authenticate_ws, get_current_user, require_instructor
 from backend.models import (
     AlertSeverity,
     AlertType,
     AttendanceStatus,
     BehaviorType,
     SessionStatus,
+    UserRole,
     VideoStatus,
 )
 from backend.pipeline.annotator import annotate_frame
@@ -56,7 +58,12 @@ router = APIRouter(tags=["sessions", "stream"])
 
 # ── Session CRUD endpoints ────────────────────────────────────────────────────
 
-@router.post("/sessions", response_model=SessionOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/sessions",
+    response_model=SessionOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_instructor)],
+)
 async def create_session(
     data: SessionCreate,
     db: AsyncSession = Depends(get_db),
@@ -71,7 +78,13 @@ async def create_session(
     return SessionOut.model_validate(session)
 
 
-@router.get("/sessions", response_model=Page)
+# Read-only session list. Any authenticated role: the Home page lands all
+# four roles on it, and Attendance and both dashboards pick from it.
+@router.get(
+    "/sessions",
+    response_model=Page,
+    dependencies=[Depends(get_current_user)],
+)
 async def list_sessions(
     classroom_id: Optional[int] = Query(None),
     skip: int = Query(0, ge=0),
@@ -82,7 +95,11 @@ async def list_sessions(
     return Page(total=total, skip=skip, limit=limit, items=[SessionOut.model_validate(r) for r in rows])
 
 
-@router.get("/sessions/{session_id}", response_model=SessionOut)
+@router.get(
+    "/sessions/{session_id}",
+    response_model=SessionOut,
+    dependencies=[Depends(get_current_user)],
+)
 async def get_session(
     session_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -99,6 +116,7 @@ async def get_session(
     "/sessions/{session_id}/videos",
     response_model=VideoUploadResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_instructor)],
 )
 async def upload_video(
     session_id: UUID,
@@ -139,7 +157,11 @@ async def upload_video(
     )
 
 
-@router.get("/sessions/{session_id}/videos", response_model=Page)
+@router.get(
+    "/sessions/{session_id}/videos",
+    response_model=Page,
+    dependencies=[Depends(require_instructor)],
+)
 async def list_session_videos(
     session_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -151,7 +173,11 @@ async def list_session_videos(
     )
 
 
-@router.get("/sessions/{session_id}/videos/{upload_id}", response_model=VideoUploadOut)
+@router.get(
+    "/sessions/{session_id}/videos/{upload_id}",
+    response_model=VideoUploadOut,
+    dependencies=[Depends(require_instructor)],
+)
 async def get_video_status(
     session_id: UUID,
     upload_id: UUID,
@@ -227,7 +253,15 @@ async def live_stream(
     passing the correct session_id in the URL.
     """
     await websocket.accept()
-    logger.info("WS live session=%s connected", session_id)
+
+    # Authenticated after accept() so the client gets a close frame with a
+    # readable reason instead of a bare handshake rejection. HTTPBearer cannot
+    # be used on a websocket route - see deps.authenticate_ws.
+    user = await authenticate_ws(websocket, UserRole.INSTRUCTOR)
+    if user is None:
+        return
+
+    logger.info("WS live session=%s user=%s connected", session_id, user.username)
 
     recognizer = await get_recognizer()
     behavior_analyzer = get_behavior_analyzer()

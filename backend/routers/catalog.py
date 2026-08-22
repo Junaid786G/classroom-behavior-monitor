@@ -17,12 +17,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend import crud
 from backend.database import get_db
+# Login required, no role check: every role needs the catalogue to fill the
+# course / subject / classroom dropdowns its own pages depend on.
+from backend.deps import get_current_user
 from backend.schemas import ClassroomOut, CourseOut, Page, SubjectOut
 
 router = APIRouter(tags=["catalog"])
 
 
-@router.get("/courses", response_model=Page)
+@router.get(
+    "/courses",
+    response_model=Page,
+    dependencies=[Depends(get_current_user)],
+)
 async def list_courses(
     active_only: bool = Query(True),
     db: AsyncSession = Depends(get_db),
@@ -37,7 +44,11 @@ async def list_courses(
     )
 
 
-@router.get("/courses/{course_id}/subjects", response_model=Page)
+@router.get(
+    "/courses/{course_id}/subjects",
+    response_model=Page,
+    dependencies=[Depends(get_current_user)],
+)
 async def list_course_subjects(
     course_id: int,
     active_only: bool = Query(
@@ -61,7 +72,11 @@ async def list_course_subjects(
     )
 
 
-@router.get("/classrooms", response_model=Page)
+@router.get(
+    "/classrooms",
+    response_model=Page,
+    dependencies=[Depends(get_current_user)],
+)
 async def list_classrooms(
     active_only: bool = Query(True, description="Hide decommissioned rooms"),
     skip: int = Query(0, ge=0),
@@ -84,7 +99,11 @@ async def list_classrooms(
     )
 
 
-@router.get("/classrooms/{classroom_id}", response_model=ClassroomOut)
+@router.get(
+    "/classrooms/{classroom_id}",
+    response_model=ClassroomOut,
+    dependencies=[Depends(get_current_user)],
+)
 async def get_classroom(classroom_id: int, db: AsyncSession = Depends(get_db)):
     room = await crud.get_classroom(db, classroom_id)
     if room is None:

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend import crud
 from backend.database import get_db
+from backend.deps import require_instructor, require_session_access
 from backend.schemas import (
     AlertAcknowledge,
     AlertOut,
@@ -22,7 +23,11 @@ router = APIRouter(tags=["analytics"])
 
 # ── Session analytics ─────────────────────────────────────────────────────────
 
-@router.get("/sessions/{session_id}/analytics", response_model=SessionAnalytics)
+@router.get(
+    "/sessions/{session_id}/analytics",
+    response_model=SessionAnalytics,
+    dependencies=[Depends(require_session_access)],
+)
 async def session_analytics(
     session_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -55,7 +60,11 @@ async def session_analytics(
 
 # ── Behavior events ───────────────────────────────────────────────────────────
 
-@router.get("/sessions/{session_id}/behavior", response_model=Page)
+@router.get(
+    "/sessions/{session_id}/behavior",
+    response_model=Page,
+    dependencies=[Depends(require_session_access)],
+)
 async def list_behavior_events(
     session_id: UUID,
     student_id: int = Query(None),
@@ -89,7 +98,10 @@ async def list_behavior_events(
     )
 
 
-@router.get("/sessions/{session_id}/behavior/timeline")
+@router.get(
+    "/sessions/{session_id}/behavior/timeline",
+    dependencies=[Depends(require_session_access)],
+)
 async def behavior_timeline(
     session_id: UUID,
     bucket_ms: int = Query(30_000, ge=1_000, le=300_000),
@@ -105,7 +117,11 @@ async def behavior_timeline(
 
 # ── Alerts ────────────────────────────────────────────────────────────────────
 
-@router.get("/sessions/{session_id}/alerts", response_model=Page)
+@router.get(
+    "/sessions/{session_id}/alerts",
+    response_model=Page,
+    dependencies=[Depends(require_session_access)],
+)
 async def list_alerts(
     session_id: UUID,
     unacknowledged_only: bool = Query(False),
@@ -121,6 +137,7 @@ async def list_alerts(
 @router.patch(
     "/sessions/{session_id}/alerts/{alert_id}/acknowledge",
     response_model=AlertOut,
+    dependencies=[Depends(require_instructor), Depends(require_session_access)],
 )
 async def acknowledge_alert(
     session_id: UUID,

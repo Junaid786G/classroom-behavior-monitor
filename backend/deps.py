@@ -1,10 +1,9 @@
 """
 deps – shared FastAPI dependencies for authentication and role gating.
 
-NOTHING HERE IS WIRED INTO THE EXISTING ROUTERS. This is the mechanism only;
-attaching it to stream/catalog/students/attendance/analytics is a later step,
-deliberately separate so the roster-gating logic in stream.py and the
-course-scoping in crud.py stay untouched for now.
+This is wired into stream/catalog/students/attendance/analytics. The
+roster-gating logic in stream.py and the course-scoping in crud.py are
+untouched: gating happens in front of the handlers, never inside them.
 
 Usage once you do wire it up:
 
@@ -28,13 +27,14 @@ Phase 2 change-password endpoint land without a revocation list.
 from __future__ import annotations
 
 from typing import Callable, List, Optional, Tuple
+from uuid import UUID
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, WebSocket, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend import crud
-from backend.database import get_db
+from backend.database import AsyncSessionLocal, get_db
 from backend.models import User, UserRole
 from backend.utils.security import JWTError, decode_access_token
 
@@ -118,6 +118,118 @@ require_hod = require_role(UserRole.HOD)
 require_instructor = require_role(UserRole.INSTRUCTOR)
 require_student = require_role(UserRole.STUDENT)
 require_training_control = require_role(UserRole.TRAINING_CONTROL)
+
+# Reading side of the reporting surface: HOD by oversight, INSTRUCTOR for the
+# course+subject pairs they hold. Pair it with require_session_access (below)
+# on any route that names a session, or the instructor half is unscoped.
+require_hod_or_instructor = require_role(UserRole.HOD, UserRole.INSTRUCTOR)
+
+
+async def require_session_access(
+    session_id: UUID,
+    user: User = Depends(require_hod_or_instructor),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Gate one session: HOD sees every session, INSTRUCTOR only assigned ones.
+
+    Attach to any route whose path names a `session_id`. The path parameter is
+    declared here, so FastAPI resolves it from the same URL the handler sees -
+    there is no way for the two to disagree about which session was gated.
+
+    404 for a missing session comes from here rather than from the handler, so
+    an instructor cannot use the 403/404 difference to probe which session ids
+    exist outside their assignments.
+
+    Costs one extra SELECT on the session, which the handler then loads again.
+    Deliberate: the alternative is passing the row through request.state and
+    coupling every handler to this dependency having run.
+    """
+    if user.role is UserRole.HOD:
+        return user
+
+    session = await crud.get_session(db, session_id)
+    if session is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
+
+    if session.subject_id not in {sid for _, sid in assignment_pairs(user)}:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "Session not found"
+        )
+    return user
+
+
+async def require_student_access(
+    student_id: int,
+    user: User = Depends(require_hod_or_instructor),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Gate one student's records: HOD anyone, INSTRUCTOR their own courses.
+
+    Course-level, not subject-level: a student belongs to a course, and an
+    instructor assigned any subject within that course already teaches them.
+
+    NOT applied to the student *list* (GET /students). That endpoint feeds the
+    Admin panel's face gallery and enrolment, which need the full roster to
+    work; scoping the list is a separate change with its own consequences.
+    """
+    if user.role is UserRole.HOD:
+        return user
+
+    student = await crud.get_student(db, student_id)
+    if student is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+
+    if student.course_id not in {cid for cid, _ in assignment_pairs(user)}:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+    return user
+
+
+async def authenticate_ws(
+    websocket: WebSocket, *roles: UserRole
+) -> Optional[User]:
+    """Authenticate a WebSocket handshake. Closes and returns None on failure.
+
+    get_current_user cannot serve here: HTTPBearer resolves from a Request,
+    which a websocket route does not have. So the Authorization header is read
+    off the handshake directly - same Bearer form, same decode, same DB reload,
+    so a deactivated account is refused at connect time.
+
+    Call AFTER websocket.accept(), so the client receives a close frame with a
+    reason it can show, rather than a bare handshake rejection. 1008 is the
+    policy-violation code; the caller returns immediately on None.
+    """
+    header = websocket.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+
+    async def _reject(reason: str) -> None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=reason)
+
+    if scheme.lower() != "bearer" or not token:
+        await _reject("Not authenticated")
+        return None
+
+    try:
+        claims = decode_access_token(token)
+        user_id = int(claims["sub"])
+    except (JWTError, KeyError, TypeError, ValueError):
+        await _reject("Could not validate credentials")
+        return None
+
+    # Its own session: this runs before the handler opens one, and must not
+    # borrow the request-scoped get_db, which websocket routes do not have.
+    async with AsyncSessionLocal() as db:
+        user = await crud.get_user(db, user_id)
+
+    if user is None:
+        await _reject("Could not validate credentials")
+        return None
+    if not user.is_active:
+        await _reject("This account has been disabled")
+        return None
+    if roles and user.role not in frozenset(roles):
+        await _reject("Requires role: " + ", ".join(sorted(r.value for r in roles)))
+        return None
+    return user
 
 
 def assignment_pairs(user: User) -> List[Tuple[int, int]]:

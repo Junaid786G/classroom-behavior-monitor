@@ -20,6 +20,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend import crud
 from backend.config import get_settings
 from backend.database import get_db
+from backend.deps import (
+    require_hod_or_instructor,
+    require_instructor,
+    require_student_access,
+)
 from backend.gallery.manager import get_gallery, rebuild_gallery_from_db
 from backend.pipeline.detector import get_detector
 from backend.pipeline.embedder import get_embedder
@@ -41,7 +46,13 @@ _ALLOWED_PHOTO_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 # ── CRUD ──────────────────────────────────────────────────────────────────────
 
-@router.get("", response_model=Page)
+# Unscoped on purpose: the Admin panel's face gallery and enrolment need
+# the whole roster. Per-student reads below are course-scoped.
+@router.get(
+    "",
+    response_model=Page,
+    dependencies=[Depends(require_hod_or_instructor)],
+)
 async def list_students(
     classroom_id: Optional[int] = Query(None),
     active_only: bool = Query(True),
@@ -55,7 +66,12 @@ async def list_students(
     return Page(total=total, skip=skip, limit=limit, items=[StudentOut.model_validate(r) for r in rows])
 
 
-@router.post("", response_model=StudentOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=StudentOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_instructor)],
+)
 async def create_student(
     data: StudentCreate,
     db: AsyncSession = Depends(get_db),
@@ -67,7 +83,11 @@ async def create_student(
     return StudentOut.model_validate(student)
 
 
-@router.get("/{student_id}", response_model=StudentOut)
+@router.get(
+    "/{student_id}",
+    response_model=StudentOut,
+    dependencies=[Depends(require_student_access)],
+)
 async def get_student(
     student_id: int,
     db: AsyncSession = Depends(get_db),
@@ -78,7 +98,11 @@ async def get_student(
     return StudentOut.model_validate(s)
 
 
-@router.patch("/{student_id}", response_model=StudentOut)
+@router.patch(
+    "/{student_id}",
+    response_model=StudentOut,
+    dependencies=[Depends(require_instructor), Depends(require_student_access)],
+)
 async def update_student(
     student_id: int,
     data: StudentUpdate,
@@ -90,7 +114,11 @@ async def update_student(
     return StudentOut.model_validate(s)
 
 
-@router.delete("/{student_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{student_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_instructor), Depends(require_student_access)],
+)
 async def delete_student(
     student_id: int,
     db: AsyncSession = Depends(get_db),
@@ -107,7 +135,11 @@ async def delete_student(
 
 # ── Photo upload ──────────────────────────────────────────────────────────────
 
-@router.post("/{student_id}/photo", response_model=StudentOut)
+@router.post(
+    "/{student_id}/photo",
+    response_model=StudentOut,
+    dependencies=[Depends(require_instructor), Depends(require_student_access)],
+)
 async def upload_photo(
     student_id: int,
     file: UploadFile = File(...),
@@ -157,7 +189,11 @@ async def upload_photo(
 
 # ── Manual embedding generation ───────────────────────────────────────────────
 
-@router.post("/{student_id}/embed", response_model=EmbeddingResponse)
+@router.post(
+    "/{student_id}/embed",
+    response_model=EmbeddingResponse,
+    dependencies=[Depends(require_instructor), Depends(require_student_access)],
+)
 async def generate_embedding(
     student_id: int,
     db: AsyncSession = Depends(get_db),
@@ -208,7 +244,11 @@ async def generate_embedding(
 
 # ── Gallery management ────────────────────────────────────────────────────────
 
-@router.post("/gallery/rebuild", response_model=GalleryBuildResponse)
+@router.post(
+    "/gallery/rebuild",
+    response_model=GalleryBuildResponse,
+    dependencies=[Depends(require_instructor)],
+)
 async def rebuild_gallery(db: AsyncSession = Depends(get_db)):
     """Rebuild the FAISS gallery from all embeddings stored in PostgreSQL."""
     total, students = await crud.list_students(db, active_only=True, limit=10_000)

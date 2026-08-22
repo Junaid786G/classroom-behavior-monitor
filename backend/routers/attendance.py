@@ -11,6 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend import crud
 from backend.database import get_db
+from backend.deps import (
+    require_instructor,
+    require_session_access,
+    require_student_access,
+)
 from backend.models import AttendanceStatus
 from backend.schemas import (
     AttendanceMarkManual,
@@ -25,7 +30,11 @@ router = APIRouter(tags=["attendance"])
 
 # ── Session attendance ────────────────────────────────────────────────────────
 
-@router.get("/sessions/{session_id}/attendance", response_model=Page)
+@router.get(
+    "/sessions/{session_id}/attendance",
+    response_model=Page,
+    dependencies=[Depends(require_session_access)],
+)
 async def list_session_attendance(
     session_id: UUID,
     include_student: bool = Query(False),
@@ -41,7 +50,11 @@ async def list_session_attendance(
     )
 
 
-@router.get("/sessions/{session_id}/attendance/summary", response_model=AttendanceSummary)
+@router.get(
+    "/sessions/{session_id}/attendance/summary",
+    response_model=AttendanceSummary,
+    dependencies=[Depends(require_session_access)],
+)
 async def attendance_summary(
     session_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -53,9 +66,16 @@ async def attendance_summary(
     return AttendanceSummary(**data)
 
 
+# HOD is read-only oversight by definition (models.py UserRole), so the one
+# endpoint that CHANGES attendance is instructor-only, scoped both ways.
 @router.patch(
     "/sessions/{session_id}/attendance/{student_id}",
     response_model=AttendanceRecordOut,
+    dependencies=[
+        Depends(require_instructor),
+        Depends(require_session_access),
+        Depends(require_student_access),
+    ],
 )
 async def manual_mark_attendance(
     session_id: UUID,
@@ -70,7 +90,10 @@ async def manual_mark_attendance(
     return AttendanceRecordOut.model_validate(rec)
 
 
-@router.get("/sessions/{session_id}/attendance/export")
+@router.get(
+    "/sessions/{session_id}/attendance/export",
+    dependencies=[Depends(require_session_access)],
+)
 async def export_attendance_csv(
     session_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -113,7 +136,11 @@ async def export_attendance_csv(
 
 # ── Per-student attendance history ────────────────────────────────────────────
 
-@router.get("/students/{student_id}/attendance", response_model=Page)
+@router.get(
+    "/students/{student_id}/attendance",
+    response_model=Page,
+    dependencies=[Depends(require_student_access)],
+)
 async def student_attendance_history(
     student_id: int,
     skip: int = Query(0, ge=0),
