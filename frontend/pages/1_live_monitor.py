@@ -16,6 +16,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import pandas as pd
 import requests
 import streamlit as st
 from PIL import Image
@@ -24,6 +25,7 @@ from auth import (
     auth_headers,
     bounce_if_unauthorized,
     cache_user_id,
+    current_user,
     render_sidebar_identity,
     require_login,
 )
@@ -178,6 +180,17 @@ class _WSMonitor:
             self._ws.send_binary(frame_jpeg)
             self._ws.settimeout(10)
             raw = self._ws.recv()
+            if not raw:
+                # The server closed rather than answering. Say so: parsing ""
+                # as JSON reports "Expecting value: line 1 column 1", which
+                # sends you looking for a protocol bug instead of a refused or
+                # dropped connection.
+                self._error = (
+                    "the server closed the connection without a result "
+                    "(session rejected, or the backend restarted mid-run)"
+                )
+                self._connected = False
+                return None
             data = json.loads(raw)
             if "frame_number" in data:
                 return data
@@ -235,110 +248,78 @@ def _init_state():
 _init_state()
 
 
-# ── Sidebar – session control ─────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown('<p class="section-label">▸ Session Control</p>', unsafe_allow_html=True)
+# ── Assignments (step 1 + 2 come from here, not from the full catalogue) ──────
 
-    classrooms = _list_classrooms(cache_user_id())
-    classroom_id = None
-    if not classrooms:
-        st.warning("No classrooms found – is the backend running and migrated?")
-    else:
-        classroom_names = {c["name"]: c["id"] for c in classrooms}
-        chosen_cls = st.selectbox("Classroom", list(classroom_names.keys()), key="cls_sel")
-        classroom_id = classroom_names[chosen_cls]
-
-    # Course → subject. A session is scoped by its subject, which implies the
-    # course; the classroom above is only the physical room / camera.
-    courses = _list_courses(cache_user_id())
-    subject_id = None
-    subject_label = ""
-    if not courses:
-        st.warning("No courses found – is the backend running and migrated?")
-    else:
-        course_names = {f"{c['code']} — {c['name']}": c["id"] for c in courses}
-        chosen_course = st.selectbox("Course", list(course_names.keys()), key="course_sel")
-        course_code = chosen_course.split(" — ", 1)[0]
-
-        subjects = _list_subjects(cache_user_id(), course_names[chosen_course])
-        if not subjects:
-            st.warning(
-                f"No subjects defined for {course_code} yet. Add one with:\n\n"
-                f"`python scripts/04_add_subject.py --course {course_code} "
-                f"--code <SUBJ> --name \"<Subject name>\"`"
-            )
-        else:
-            subject_names = {
-                f"{s['subject_code']} — {s['subject_name']}": s["id"] for s in subjects
-            }
-            chosen_subject = st.selectbox("Subject", list(subject_names.keys()), key="subj_sel")
-            subject_id = subject_names[chosen_subject]
-            subject_label = chosen_subject.split(" — ", 1)[-1]
-
-    instructor = st.text_input("Instructor", "Dr. Ahmed")
-
-    st.divider()
-
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        if st.button("▶ New Session", use_container_width=True,
-                     disabled=(st.session_state.processing
-                               or subject_id is None
-                               or classroom_id is None)):
-            payload = {
-                "subject_id":   subject_id,
-                "classroom_id": classroom_id,
-                # Deprecated free-text mirror, still sent so the dashboards that
-                # read `subject` keep rendering until they move to subject_id.
-                "subject":      subject_label,
-                "instructor":   instructor,
-                "title":        f"{subject_label} – {time.strftime('%H:%M')}",
-            }
-            resp = _post("/sessions", json=payload)
-            if resp and "id" in resp:
-                st.session_state.session_id = resp["id"]
-                st.session_state.frame_pos  = 0
-                st.session_state.results    = []
-                st.session_state.attendance = {}
-                st.session_state.latest_frame = None
-                st.success(f"Session created")
-            else:
-                st.error("Could not create session – is the backend running?")
-
-    with col_b:
-        if st.button("⏹ Stop", use_container_width=True, disabled=not st.session_state.processing):
-            st.session_state.processing = False
-            if st.session_state.monitor:
-                st.session_state.monitor.close()
-                st.session_state.monitor = None
-
-    st.divider()
-    st.markdown('<p class="section-label">▸ Existing Session</p>', unsafe_allow_html=True)
-    sessions = _list_sessions(cache_user_id(), classroom_id)
-    if sessions:
-        session_opts = {
-            f"{s.get('title') or s.get('subject','?')} [{s['status']}]": s["id"]
-            for s in sessions
-        }
-        chosen_s = st.selectbox("Load session", ["— new —"] + list(session_opts.keys()))
-        if chosen_s != "— new —" and st.button("Load", use_container_width=True):
-            st.session_state.session_id  = session_opts[chosen_s]
-            st.session_state.processing  = False
-            st.session_state.frame_pos   = 0
-            st.session_state.results     = []
-            st.session_state.attendance  = {}
-            st.session_state.latest_frame = None
-
-    if st.session_state.session_id:
-        st.markdown(
-            f'<p style="color:#00d4ff;font-size:0.72rem;word-break:break-all">'
-            f'SESSION<br>{st.session_state.session_id}</p>',
-            unsafe_allow_html=True,
-        )
+@st.cache_data(ttl=30)
+def _my_assignments(user_id: int):
+    """The course+subject pairs this instructor may teach. Scoped server-side."""
+    d = _get("/me/assignments") or {}
+    return d.get("items", [])
 
 
-# ── Main layout ───────────────────────────────────────────────────────────────
+# ── Shared pieces ─────────────────────────────────────────────────────────────
+
+def _video_picker(key: str) -> None:
+    """File uploader that stashes the video and probes its frame count / fps."""
+    uploaded = st.file_uploader(
+        "Recorded video  (MP4 / AVI / MKV / MOV / WEBM)",
+        type=["mp4", "avi", "mkv", "mov", "webm"],
+        help="Processed frame by frame through the backend pipeline.",
+        key=key,
+    )
+    # Compare by original filename: the temp path changes on every rerun.
+    if uploaded and st.session_state.get("uploaded_filename") != uploaded.name:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix)
+        tmp.write(uploaded.read())
+        tmp.close()
+        st.session_state.uploaded_filename = uploaded.name
+        st.session_state.video_path = tmp.name
+        st.session_state.frame_pos = 0
+        cap_probe = cv2.VideoCapture(tmp.name)
+        st.session_state.total_frames = int(cap_probe.get(cv2.CAP_PROP_FRAME_COUNT))
+        st.session_state.source_fps = float(cap_probe.get(cv2.CAP_PROP_FPS) or 0.0)
+        cap_probe.release()
+
+
+def _connect_and_process() -> bool:
+    """Open the WebSocket for the current session and arm the frame loop."""
+    monitor = _WSMonitor(
+        st.session_state.session_id,
+        send_annotated=True,
+        source_fps=st.session_state.get("source_fps", 0.0),
+        auth_header=auth_headers(),
+    )
+    if not monitor.connect():
+        st.error(f"WebSocket error: {monitor.error}")
+        return False
+    st.session_state.monitor = monitor
+    st.session_state.processing = True
+    st.session_state.frame_pos = 0
+    st.session_state.start_ts = time.time()
+    st.session_state.results = []
+    st.session_state.attendance = {}
+    return True
+
+
+def _clear_session() -> None:
+    """Drop the active session and its frame state, back to the setup flow."""
+    if st.session_state.monitor:
+        st.session_state.monitor.close()
+    st.session_state.monitor = None
+    st.session_state.session_id = None
+    st.session_state.processing = False
+    st.session_state.frame_pos = 0
+    st.session_state.results = []
+    st.session_state.detections = []
+    st.session_state.attendance = {}
+    st.session_state.latest_frame = None
+    st.session_state.latest_frame_b64 = None
+    st.session_state.start_ts = None
+    st.session_state.active_course_label = None
+    st.session_state.active_subject_label = None
+
+
+# ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="cctv-header" style="margin-bottom:1rem">
   <h1>📹 LIVE CLASSROOM MONITOR</h1>
@@ -346,63 +327,273 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+user = current_user() or {}
+instructor_name = user.get("full_name") or user.get("username") or "—"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SETUP FLOW — course → subject → instructor → source → start
+# Shown until a session is active. Everything below the flow reads the
+# instructor's OWN sessions: /sessions is scoped to their assignments.
+# ══════════════════════════════════════════════════════════════════════════════
+
+if not st.session_state.session_id:
+
+    assignments = _my_assignments(cache_user_id())
+
+    if not assignments:
+        # Not an error: a real account can exist with nothing assigned yet.
+        # Nothing on this page is startable in that state, so say so plainly
+        # rather than rendering five steps of empty dropdowns.
+        st.warning(
+            "**No course or subject is assigned to you yet.**\n\n"
+            f"Monitoring is scoped to the course+subject pairs assigned to "
+            f"**{instructor_name}**, and there are none. Ask Training Control "
+            "to assign you a subject, then reload this page."
+        )
+        st.stop()
+
+    # ── Step 1 — course ───────────────────────────────────────────────────────
+    st.markdown('<p class="section-label">▸ Step 1 · Course</p>', unsafe_allow_html=True)
+    courses = {}
+    for a in assignments:
+        courses.setdefault(f"{a['course_code']} — {a['course_name']}", a["course_id"])
+    chosen_course = st.selectbox(
+        "Course", list(courses), key="flow_course",
+        help="Only the courses you are assigned to teach.",
+    )
+    course_id = courses[chosen_course]
+
+    # ── Step 2 — subject ──────────────────────────────────────────────────────
+    st.markdown('<p class="section-label">▸ Step 2 · Subject</p>', unsafe_allow_html=True)
+    subjects = {
+        f"{a['subject_code']} — {a['subject_name']}": a
+        for a in assignments if a["course_id"] == course_id
+    }
+    chosen_subject = st.selectbox(
+        "Subject", list(subjects), key="flow_subject",
+        help="Your assigned subjects within the selected course.",
+    )
+    subject = subjects[chosen_subject]
+
+    # ── Step 3 — instructor (identity, not a text box) ────────────────────────
+    st.markdown('<p class="section-label">▸ Step 3 · Instructor</p>', unsafe_allow_html=True)
+    # Taken from the logged-in identity. It used to be a free-text box
+    # defaulting to "Dr. Ahmed", which meant the session's instructor was
+    # whoever the typist claimed to be.
+    st.markdown(
+        f"""
+        <div class="identity-card" style="margin:0 0 0.8rem">
+          <div class="identity-label">SESSION WILL BE RECORDED AS</div>
+          <div class="identity-name">{instructor_name}</div>
+          <div class="identity-role">{user.get('username', '—')} · signed in</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Step 4 — source ───────────────────────────────────────────────────────
+    st.markdown('<p class="section-label">▸ Step 4 · Source</p>', unsafe_allow_html=True)
+    source = st.radio(
+        "Video source",
+        ["📼 Recorded video (upload)", "📡 Live stream URL"],
+        key="flow_source",
+        horizontal=True,
+    )
+    live_selected = source.startswith("📡")
+
+    if live_selected:
+        # Flagged, not built. classrooms.camera_url is stored and shown in the
+        # Admin panel, and pipeline/capture.py's VideoCapture wraps
+        # cv2.VideoCapture, which would open an RTSP URL - but nothing joins
+        # the two: the only VideoCapture call site processes an uploaded file,
+        # no endpoint accepts a stream URL, and the WebSocket ingests frames
+        # the client has already decoded. Wiring it is its own piece of work.
+        st.info(
+            "**Live stream capture is not built yet.**\n\n"
+            "Classrooms can store a camera URL, and the capture layer can open "
+            "an RTSP source, but nothing connects them: no endpoint accepts a "
+            "stream URL, and the processing pipeline reads uploaded files only. "
+            "Use a recorded video for now."
+        )
+
+    classrooms = _list_classrooms(cache_user_id())
+    classroom_id = None
+    if not classrooms:
+        st.warning("No classrooms found — is the backend running and migrated?")
+    else:
+        room_names = {c["name"]: c["id"] for c in classrooms}
+        chosen_room = st.selectbox(
+            "Room / camera", list(room_names), key="flow_room",
+            help="The physical room this recording came from. Sessions are "
+                 "scoped by subject; the room identifies the camera.",
+        )
+        classroom_id = room_names[chosen_room]
+
+    if not live_selected:
+        _video_picker("flow_upload")
+        if st.session_state.video_path:
+            st.caption(
+                f"Loaded **{st.session_state.get('uploaded_filename', '—')}** · "
+                f"{st.session_state.total_frames:,} frames · "
+                f"{st.session_state.source_fps:.1f} fps"
+            )
+
+    # ── Step 5 — start ────────────────────────────────────────────────────────
+    st.markdown('<p class="section-label">▸ Step 5 · Start</p>', unsafe_allow_html=True)
+
+    blockers = []
+    if live_selected:
+        blockers.append("live stream capture is not available")
+    elif not st.session_state.video_path:
+        blockers.append("no video uploaded")
+    if classroom_id is None:
+        blockers.append("no room selected")
+
+    if blockers:
+        st.caption("Cannot start yet — " + "; ".join(blockers) + ".")
+
+    if st.button(
+        "▶ Start Session & Processing",
+        type="primary",
+        use_container_width=True,
+        disabled=bool(blockers),
+    ):
+        payload = {
+            "subject_id": subject["subject_id"],
+            "classroom_id": classroom_id,
+            # Deprecated free-text mirror, still sent so dashboards that read
+            # `subject` keep rendering until they move to subject_id.
+            "subject": subject["subject_name"],
+            "instructor": instructor_name,
+            "title": f"{subject['subject_name']} – {time.strftime('%H:%M')}",
+        }
+        resp = _post("/sessions", json=payload)
+        if not resp or "id" not in resp:
+            st.error("Could not create the session — is the backend running?")
+        else:
+            st.session_state.session_id = resp["id"]
+            st.session_state.detections = []
+            st.session_state.latest_frame_b64 = None
+            # Copied, not read back from the flow_* widget keys: Streamlit drops
+            # a widget's key once that widget stops rendering, and the whole
+            # setup block disappears the moment a session becomes active.
+            st.session_state.active_course_label = chosen_course
+            st.session_state.active_subject_label = chosen_subject
+            if _connect_and_process():
+                _list_sessions.clear()      # the new session belongs in the list
+                st.rerun()
+
+    # ── My sessions ───────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown('<p class="section-label">▸ My Sessions</p>', unsafe_allow_html=True)
+
+    my_sessions = _list_sessions(cache_user_id())
+    if not my_sessions:
+        st.caption("No sessions recorded against your subjects yet.")
+    else:
+        st.caption(
+            f"{len(my_sessions)} session(s) in your assigned subjects. "
+            "The list is scoped server-side — other instructors' sessions are "
+            "not returned to this page."
+        )
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Status": s.get("status", "—").upper(),
+                    "Title": s.get("title") or s.get("subject") or "—",
+                    "Started": (s.get("started_at") or "—")[:16].replace("T", " "),
+                    "Frames": s.get("total_frames_processed", 0),
+                }
+                for s in my_sessions
+            ]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        opts = {
+            f"{s.get('title') or s.get('subject', '?')} [{s['status']}]": s["id"]
+            for s in my_sessions
+        }
+        col_pick, col_load = st.columns([3, 1])
+        with col_pick:
+            chosen_prev = st.selectbox(
+                "Open a previous session", ["— none —"] + list(opts),
+                key="flow_prev", label_visibility="collapsed",
+            )
+        with col_load:
+            if st.button("Open", use_container_width=True,
+                         disabled=chosen_prev == "— none —"):
+                st.session_state.session_id = opts[chosen_prev]
+                st.session_state.active_subject_label = chosen_prev
+                st.session_state.active_course_label = chosen_course
+                st.session_state.frame_pos = 0
+                st.session_state.results = []
+                st.session_state.detections = []
+                st.session_state.attendance = {}
+                st.session_state.latest_frame_b64 = None
+                st.rerun()
+
+    st.stop()   # setup mode ends here; the monitor below needs a session
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MONITOR — an active session
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Session bar ───────────────────────────────────────────────────────────────
+bar_left, bar_right = st.columns([4, 1])
+with bar_left:
+    st.markdown(
+        f"""
+        <div class="identity-card" style="margin:0 0 0.6rem">
+          <div class="identity-label">ACTIVE SESSION</div>
+          <div class="identity-name">{st.session_state.get('active_subject_label') or 'Session'}</div>
+          <div class="identity-role">
+            {st.session_state.get('active_course_label') or ''} · {instructor_name} ·
+            <span style="word-break:break-all">{st.session_state.session_id}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with bar_right:
+    if st.session_state.processing:
+        if st.button("⏹ Stop", use_container_width=True):
+            st.session_state.processing = False
+            if st.session_state.monitor:
+                st.session_state.monitor.close()
+                st.session_state.monitor = None
+            st.rerun()
+    else:
+        if st.button("← End session", use_container_width=True):
+            _clear_session()
+            _list_sessions.clear()
+            st.rerun()
+
 video_col, stats_col = st.columns([3, 2], gap="medium")
 
 # ── Video column ──────────────────────────────────────────────────────────────
 with video_col:
-    uploaded = st.file_uploader(
-        "Upload classroom video  (MP4 / AVI / MKV)",
-        type=["mp4", "avi", "mkv", "mov", "webm"],
-        help="The video is processed frame-by-frame through the backend pipeline.",
-    )
+    # A session opened from My Sessions arrives with no video attached, so the
+    # picker stays available here until processing actually starts.
+    if not st.session_state.processing:
+        if not st.session_state.video_path:
+            _video_picker("monitor_upload")
+        if st.session_state.video_path and st.button(
+            "▶ Start Processing", use_container_width=True
+        ):
+            if _connect_and_process():
+                st.rerun()
 
-    # Save uploaded file to temp path once — compare by original filename, not temp path
-    if uploaded and st.session_state.get("uploaded_filename") != uploaded.name:
-        tmp = tempfile.NamedTemporaryFile(
-            delete=False, suffix=Path(uploaded.name).suffix
-        )
-        tmp.write(uploaded.read())
-        tmp.close()
-        st.session_state.uploaded_filename = uploaded.name
-        st.session_state.video_path  = tmp.name
-        st.session_state.frame_pos   = 0
-        cap_probe = cv2.VideoCapture(tmp.name)
-        st.session_state.total_frames = int(cap_probe.get(cv2.CAP_PROP_FRAME_COUNT))
-        st.session_state.source_fps = float(cap_probe.get(cv2.CAP_PROP_FPS) or 0.0)
-        cap_probe.release()
-
-    # Start / progress
-    start_disabled = (
-        not st.session_state.video_path
-        or not st.session_state.session_id
-        or st.session_state.processing
-    )
-    if st.button("▶ Start Processing", disabled=start_disabled, use_container_width=True):
-        # Create WebSocket connection
-        monitor = _WSMonitor(
-            st.session_state.session_id,
-            send_annotated=True,
-            source_fps=st.session_state.get("source_fps", 0.0),
-            auth_header=auth_headers(),
-        )
-        ok = monitor.connect()
-        if ok:
-            st.session_state.monitor    = monitor
-            st.session_state.processing = True
-            st.session_state.frame_pos  = 0
-            st.session_state.start_ts   = time.time()
-            st.session_state.results    = []
-            st.session_state.attendance = {}
-        else:
-            st.error(f"WebSocket error: {monitor.error}")
-
-    # Progress bar
     total = max(1, st.session_state.total_frames // (_SKIP_FRAMES + 1))
     processed = st.session_state.frame_pos // (_SKIP_FRAMES + 1)
     progress = min(1.0, processed / total)
-    st.progress(progress, text=f"Frame {st.session_state.frame_pos} / {st.session_state.total_frames}")
+    st.progress(
+        progress,
+        text=f"Frame {st.session_state.frame_pos} / {st.session_state.total_frames}",
+    )
 
-    # Video display — read directly from session state so each rerun shows the latest frame
     if st.session_state.latest_frame_b64:
         st.image(
             base64.b64decode(st.session_state.latest_frame_b64),
@@ -419,12 +610,9 @@ with video_col:
             unsafe_allow_html=True,
         )
 
-    # Live badge
     if st.session_state.processing:
-        st.markdown(
-            '<span class="live-badge">● PROCESSING</span>',
-            unsafe_allow_html=True,
-        )
+        st.markdown('<span class="live-badge">● PROCESSING</span>', unsafe_allow_html=True)
+
 
 # ── Stats column ──────────────────────────────────────────────────────────────
 with stats_col:
