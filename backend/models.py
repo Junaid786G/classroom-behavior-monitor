@@ -334,6 +334,13 @@ class User(TimestampMixin, Base):
         ForeignKey("students.id", ondelete="SET NULL")
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Set on accounts created with a password someone else chose - the seeded
+    # student logins share one. While true, every gated route refuses the
+    # caller except /auth/me and /auth/me/password; changing the password
+    # clears it. See backend/deps.py get_current_user.
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     linked_student: Mapped[Optional["Student"]] = relationship(back_populates="login")

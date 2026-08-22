@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend import crud
 from backend.config import get_settings
 from backend.database import get_db
-from backend.deps import assignment_pairs, get_current_user
+from backend.deps import assignment_pairs, get_authenticated_user
 from backend.models import User, UserRole
 from backend.schemas import (
     LoginRequest,
@@ -110,7 +110,7 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
 @router.post("/me/password", response_model=PasswordChangeResponse)
 async def change_password(
     payload: PasswordChangeRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Change your own password, proving you know the current one.
@@ -118,6 +118,12 @@ async def change_password(
     Any authenticated role: everyone owns their own credential, and no role
     may change anyone else's here - there is no user id in this route, the
     same discipline /me/records uses.
+
+    Depends on get_authenticated_user, NOT get_current_user: a user carrying
+    must_change_password is refused everywhere else, and this is one of the
+    two routes they must still reach - the other being GET /auth/me, which
+    tells the client that is the situation. Succeeding here clears the flag,
+    because crud.set_password writes it alongside the hash.
 
     A wrong current password answers 400, NOT 401. The token is valid and the
     session is alive; the thing that failed is a credential inside the body.
@@ -153,7 +159,7 @@ async def change_password(
 
 
 @router.get("/me", response_model=UserOut)
-async def me(user: User = Depends(get_current_user)):
+async def me(user: User = Depends(get_authenticated_user)):
     """Who the bearer of this token is, read fresh from the DB.
 
     The frontend calls this on load to decide which pages to show. Because it

@@ -51,7 +51,7 @@ def _unauthorized(detail: str) -> HTTPException:
     )
 
 
-async def get_current_user(
+async def get_authenticated_user(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
     db: AsyncSession = Depends(get_db),
 ) -> User:
@@ -87,6 +87,34 @@ async def get_current_user(
     if not user.is_active:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "This account has been disabled"
+        )
+    return user
+
+
+async def get_current_user(
+    user: User = Depends(get_authenticated_user),
+) -> User:
+    """The authenticated user, refused while they owe a password change.
+
+    Split from get_authenticated_user so this check lands in ONE place and
+    every gated route inherits it: require_role, require_session_access and
+    require_student_access all depend on this, and the routers depend on
+    those. Nothing in backend/routers changed to enforce it.
+
+    The two endpoints a flagged user must still reach - GET /auth/me and
+    POST /auth/me/password - depend on get_authenticated_user instead, which
+    is the whole reason the pair exists.
+
+    403, not 401: the token is valid and the session is alive. A 401 would tell
+    every client the session had died, and ours (bounce_if_unauthorized) would
+    log the user out at the exact moment they need to be logged in to fix it.
+    Clients decide what to do from UserOut.must_change_password, not from this
+    string.
+    """
+    if user.must_change_password:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Password change required before using this account",
         )
     return user
 
@@ -225,6 +253,11 @@ async def authenticate_ws(
         return None
     if not user.is_active:
         await _reject("This account has been disabled")
+        return None
+    # Websocket routes do not pass through get_current_user, so the
+    # password-change gate is repeated here rather than inherited.
+    if user.must_change_password:
+        await _reject("Password change required before using this account")
         return None
     if roles and user.role not in frozenset(roles):
         await _reject("Requires role: " + ", ".join(sorted(r.value for r in roles)))

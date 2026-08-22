@@ -1255,7 +1255,12 @@ async def set_password(db: AsyncSession, user_id: int, password_hash: str) -> No
     credential it was just told to use.
     """
     await db.execute(
-        update(User).where(User.id == user_id).values(password_hash=password_hash)
+        update(User)
+        .where(User.id == user_id)
+        # Cleared here and nowhere else: POST /auth/me/password is the only
+        # path that writes a hash, and it proves the current password first,
+        # so the flag cannot be dropped without that proof.
+        .values(password_hash=password_hash, must_change_password=False)
     )
     await db.commit()
 

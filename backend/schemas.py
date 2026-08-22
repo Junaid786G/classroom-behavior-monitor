@@ -569,6 +569,8 @@ class UserOut(BaseModel):
     role: UserRole
     full_name: Optional[str] = None
     linked_student_id: Optional[int] = None
+    # The frontend gates on this field, never on an error string.
+    must_change_password: bool = False
     assignments: List[AssignmentOut] = []
     last_login_at: Optional[datetime] = None
 
@@ -586,6 +588,7 @@ class UserOut(BaseModel):
             role=user.role,
             full_name=user.full_name,
             linked_student_id=user.linked_student_id,
+            must_change_password=user.must_change_password,
             assignments=[
                 AssignmentOut(course_id=a.course_id, subject_id=a.subject_id)
                 for a in user.instructor_assignments
