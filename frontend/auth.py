@@ -313,7 +313,100 @@ def _attempt_password_change(current: str, new: str) -> Optional[str]:
     return f"Password change failed ({r.status_code})."
 
 
+def _refresh_identity() -> None:
+    """Re-read /auth/me into session state.
+
+    Called after a forced password change so must_change_password flips to
+    False here too. The server has already cleared it; this is the copy the
+    frontend gates on.
+    """
+    try:
+        r = requests.get(f"{API_BASE}/auth/me", headers=auth_headers(), timeout=8)
+        if r.status_code == 200:
+            st.session_state[_USER_KEY] = r.json()
+    except Exception:
+        # Leave the stale copy: the next rerun tries again, and every gated
+        # route would still refuse if the flag really were set.
+        pass
+
+
 # ── Screens ───────────────────────────────────────────────────────────────────
+
+def _render_forced_password_change(user: dict) -> None:
+    """Make a first-login password change the only thing on offer. Never returns.
+
+    Reached when the account carries must_change_password - today, the seeded
+    student logins, which all share one secret. The backend refuses every
+    gated route for such a user anyway (deps.get_current_user), so this is the
+    honest face of that refusal rather than the enforcement itself: without it
+    the pages would render and then sit empty on a wall of 403s.
+    """
+    st.markdown(
+        "<style>[data-testid='stSidebarNav'], [data-testid='stSidebarNavItems']"
+        "{display:none !important;}</style>",
+        unsafe_allow_html=True,
+    )
+
+    name = user.get("full_name") or user.get("username") or "—"
+
+    left, mid, right = st.columns([1, 1.6, 1])
+    with mid:
+        st.markdown(
+            f"""
+            <div class="login-hero">
+              <h1>🔑 CHOOSE YOUR PASSWORD</h1>
+              <p>{name} · first sign-in</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.warning(
+            "Your account was created with a password that other people know — "
+            "the same one was issued to your whole class. Set your own before "
+            "continuing; nothing else is available until you do."
+        )
+
+        with st.form("_auth_forced_password", clear_on_submit=False):
+            current_pw = st.text_input(
+                "Password you were given", type="password",
+                autocomplete="current-password", key="_forced_current",
+            )
+            new_pw = st.text_input(
+                "New password", type="password", autocomplete="new-password",
+                key="_forced_new", help=f"At least {MIN_PASSWORD_LENGTH} characters.",
+            )
+            confirm_pw = st.text_input(
+                "Confirm new password", type="password",
+                autocomplete="new-password", key="_forced_confirm",
+            )
+            submitted = st.form_submit_button(
+                "SET PASSWORD AND CONTINUE", use_container_width=True
+            )
+
+        if submitted:
+            if not current_pw or not new_pw or not confirm_pw:
+                st.error("Fill in all three fields.")
+            elif new_pw != confirm_pw:
+                st.error("The new passwords do not match.")
+            elif len(new_pw) < MIN_PASSWORD_LENGTH:
+                st.error(f"Use at least {MIN_PASSWORD_LENGTH} characters.")
+            elif new_pw == current_pw:
+                st.error("Choose a password different from the one you were given.")
+            else:
+                error = _attempt_password_change(current_pw, new_pw)
+                if error:
+                    st.error(error)
+                else:
+                    _refresh_identity()
+                    st.rerun()
+
+        # Not a trap: someone who signed in as the wrong person needs a way out.
+        if st.button("Log out", use_container_width=True, key="_forced_logout"):
+            logout()
+            st.rerun()
+
+    st.stop()
+
 
 def _render_login_screen(expired: bool) -> None:
     """Draw the login form and stop the page. Never returns."""
@@ -388,7 +481,13 @@ def require_login() -> dict:
     if not is_authenticated():
         _render_login_screen(expired=expired)   # calls st.stop()
 
-    return st.session_state[_USER_KEY]
+    user = st.session_state[_USER_KEY]
+    # Every page calls require_login(), so one check here gates all of them -
+    # the same reason the backend puts its half in get_current_user.
+    if user.get("must_change_password"):
+        _render_forced_password_change(user)    # calls st.stop()
+
+    return user
 
 
 def render_sidebar_identity() -> None:
