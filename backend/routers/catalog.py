@@ -19,10 +19,38 @@ from backend import crud
 from backend.database import get_db
 # Login required, no role check: every role needs the catalogue to fill the
 # course / subject / classroom dropdowns its own pages depend on.
-from backend.deps import get_current_user
-from backend.schemas import ClassroomOut, CourseOut, Page, SubjectOut
+from backend.deps import get_current_user, require_instructor
+from backend.models import User
+from backend.schemas import (
+    AssignmentDetailOut,
+    ClassroomOut,
+    CourseOut,
+    Page,
+    SubjectOut,
+)
 
 router = APIRouter(tags=["catalog"])
+
+
+# Instructor-scoped: the one endpoint that answers "what may I teach?", used
+# to build the course -> subject flow in Live Monitor. Scoping lives here and
+# not in a query parameter on /courses, so a page cannot ask for the whole
+# catalogue by omitting a flag.
+@router.get("/me/assignments", response_model=Page)
+async def my_assignments(
+    user: User = Depends(require_instructor),
+    db: AsyncSession = Depends(get_db),
+):
+    """The logged-in instructor's assigned course+subject pairs, with names.
+
+    INSTRUCTOR only. HOD reads whole courses through the course overview, and
+    the other roles have no assignments by definition.
+    """
+    rows = await crud.list_instructor_assignments(db, user.id)
+    return Page(
+        total=len(rows), skip=0, limit=len(rows),
+        items=[AssignmentDetailOut(**r) for r in rows],
+    )
 
 
 @router.get(

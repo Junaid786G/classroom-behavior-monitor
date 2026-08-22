@@ -449,6 +449,22 @@ class AssignmentOut(BaseModel):
     subject_id: int
 
 
+class AssignmentDetailOut(BaseModel):
+    """One assigned course+subject pair, with the names needed to show it.
+
+    AssignmentOut carries ids alone, which is all a token claim needs. A UI
+    building a course -> subject picker needs labels, and fetching the whole
+    catalogue to resolve two ids would both leak every course into a page that
+    must show only the assigned ones, and cost a request per course.
+    """
+    course_id: int
+    course_code: str
+    course_name: str
+    subject_id: int
+    subject_code: str
+    subject_name: str
+
+
 class UserOut(BaseModel):
     """Identity as returned by /auth/login and /auth/me.
 

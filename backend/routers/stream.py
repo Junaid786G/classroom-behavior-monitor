@@ -27,13 +27,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend import crud
 from backend.config import get_settings
 from backend.database import AsyncSessionLocal, get_db
-from backend.deps import authenticate_ws, get_current_user, require_instructor
+from backend.deps import (
+    assignment_pairs,
+    authenticate_ws,
+    get_current_user,
+    require_instructor,
+)
 from backend.models import (
     AlertSeverity,
     AlertType,
     AttendanceStatus,
     BehaviorType,
     SessionStatus,
+    User,
     UserRole,
     VideoStatus,
 )
@@ -78,20 +84,28 @@ async def create_session(
     return SessionOut.model_validate(session)
 
 
-# Read-only session list. Any authenticated role: the Home page lands all
-# four roles on it, and Attendance and both dashboards pick from it.
-@router.get(
-    "/sessions",
-    response_model=Page,
-    dependencies=[Depends(get_current_user)],
-)
+# Any authenticated role - the Home page lands all four on it, and Attendance
+# and both dashboards pick from it - but an INSTRUCTOR sees only sessions in
+# the subjects they are assigned. Without that, the list offered them 66
+# sessions of which 65 answered 404 when opened, since require_session_access
+# scopes every per-session read. An instructor with no assignments gets an
+# empty list, not the department's history.
+@router.get("/sessions", response_model=Page)
 async def list_sessions(
     classroom_id: Optional[int] = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    total, rows = await crud.list_sessions(db, classroom_id=classroom_id, skip=skip, limit=limit)
+    subject_ids = (
+        [subject_id for _, subject_id in assignment_pairs(user)]
+        if user.role is UserRole.INSTRUCTOR
+        else None
+    )
+    total, rows = await crud.list_sessions(
+        db, classroom_id=classroom_id, subject_ids=subject_ids, skip=skip, limit=limit
+    )
     return Page(total=total, skip=skip, limit=limit, items=[SessionOut.model_validate(r) for r in rows])
 
 

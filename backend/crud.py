@@ -19,6 +19,7 @@ from backend.models import (
     Classroom,
     Course,
     FaceDetection,
+    InstructorAssignment,
     PoseSnapshot,
     Session,
     SessionStatus,
@@ -223,9 +224,21 @@ async def list_subjects(
 # ── Session ───────────────────────────────────────────────────────────────────
 
 async def create_session(db: AsyncSession, data: SessionCreate) -> Session:
+    """Create a session and COMMIT before returning it.
+
+    Committing here rather than leaving it to get_db's teardown is deliberate.
+    The caller is handed an id it is expected to use immediately - the Live
+    Monitor flow opens the processing WebSocket on the next line - and that
+    socket resolves the session on its own connection, via AsyncSessionLocal.
+    get_db commits after the endpoint returns, so a client fast enough to
+    connect before that teardown ran would be told 4004 Session not found for
+    a session it had just successfully created. That race is invisible when a
+    human clicks two buttons seconds apart, and near-certain when one button
+    does both.
+    """
     obj = Session(**data.model_dump())
     db.add(obj)
-    await db.flush()
+    await db.commit()
     await db.refresh(obj)
     return obj
 
@@ -252,17 +265,59 @@ async def get_session_course_id(db: AsyncSession, session_id: UUID) -> Optional[
 async def list_sessions(
     db: AsyncSession,
     classroom_id: Optional[int] = None,
+    subject_ids: Optional[List[int]] = None,
     skip: int = 0,
     limit: int = 50,
 ) -> Tuple[int, List[Session]]:
+    """List sessions, optionally narrowed to a room and/or a set of subjects.
+
+    subject_ids=None means no subject filter at all; an EMPTY list means no
+    subjects are permitted and the caller gets nothing. That distinction is
+    what lets the router hand an instructor with no assignments an empty list
+    rather than the whole department's history.
+    """
     q = select(Session)
     if classroom_id is not None:
         q = q.where(Session.classroom_id == classroom_id)
+    if subject_ids is not None:
+        q = q.where(Session.subject_id.in_(subject_ids))
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar_one()
     rows = (
         await db.execute(q.order_by(Session.created_at.desc()).offset(skip).limit(limit))
     ).scalars().all()
     return total, list(rows)
+
+
+async def list_instructor_assignments(db: AsyncSession, user_id: int) -> List[dict]:
+    """The course+subject pairs one instructor may teach, with their names.
+
+    Archived subjects are excluded: an assignment to one cannot be acted on -
+    a session started against an archived subject would be unreachable from
+    every picker that filters them out - so it has no place in a flow whose
+    whole purpose is choosing what to start.
+    """
+    rows = (
+        await db.execute(
+            select(
+                Course.id.label("course_id"),
+                Course.code.label("course_code"),
+                Course.name.label("course_name"),
+                Subject.id.label("subject_id"),
+                Subject.subject_code,
+                Subject.subject_name,
+            )
+            .select_from(InstructorAssignment)
+            .join(Subject, Subject.id == InstructorAssignment.subject_id)
+            .join(Course, Course.id == InstructorAssignment.course_id)
+            .where(
+                InstructorAssignment.user_id == user_id,
+                Subject.is_active.is_(True),
+                Course.is_active.is_(True),
+            )
+            .order_by(Course.code, Subject.subject_code)
+        )
+    ).all()
+    return [dict(r._mapping) for r in rows]
 
 
 async def start_session(db: AsyncSession, session_id: UUID) -> Optional[Session]:
