@@ -501,12 +501,34 @@ class HealthResponse(BaseModel):
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
+# Applies to passwords a user chooses, not to the seeded ones: 03_migrate and
+# the 05/06 scripts write hashes directly and never come through here.
+MIN_PASSWORD_LENGTH = 8
+
+
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=80)
     # No max_length: rejecting an over-length password here would tell an
     # attacker where the bcrypt 72-byte ceiling is. verify_password returns a
     # plain False for anything too long.
     password: str = Field(..., min_length=1)
+
+
+class PasswordChangeRequest(BaseModel):
+    """Change your own password. Both halves are required.
+
+    Unlike LoginRequest.password, new_password IS bounded here. That comment
+    withholds the bcrypt ceiling from an unauthenticated caller, which is the
+    right call at the door; this caller is already authenticated and changing
+    their own credential, and hash_password raises above 72 bytes - so
+    refusing it with a message beats a 500 that says nothing.
+    """
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=MIN_PASSWORD_LENGTH)
+
+
+class PasswordChangeResponse(BaseModel):
+    detail: str = "Password updated"
 
 
 class AssignmentOut(BaseModel):

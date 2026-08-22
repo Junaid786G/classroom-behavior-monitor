@@ -5,10 +5,16 @@ Two endpoints only: exchange credentials for a JWT, and read back who the
 bearer of a JWT is. The gating *mechanism* lives in backend/deps.py and is not
 attached to any other router yet.
 
-A change-password endpoint belongs here later. It needs nothing new: it will
-take the current user from `Depends(get_current_user)`, re-check the old
-password with `verify_password`, and write `hash_password(new)` — the same
-helpers login already uses, and the same ones the seed migration used.
+POST /auth/me/password does exactly what this file always said it would: take
+the current user from `Depends(get_current_user)`, re-check the old password
+with `verify_password`, and write `hash_password(new)`.
+
+WHAT IT DOES NOT DO: revoke tokens. A JWT already issued stays valid until it
+expires - up to access_token_expire_minutes, on every device holding one -
+because there is no revocation list, which is the same property that let this
+endpoint land without one (see backend/deps.py). Changing a password stops the
+OLD password working for future logins; it does not sign anyone out. Closing
+that needs a token version on the users row, or a denylist.
 """
 
 from __future__ import annotations
@@ -21,8 +27,19 @@ from backend.config import get_settings
 from backend.database import get_db
 from backend.deps import assignment_pairs, get_current_user
 from backend.models import User, UserRole
-from backend.schemas import LoginRequest, TokenResponse, UserOut
-from backend.utils.security import create_access_token, verify_password
+from backend.schemas import (
+    LoginRequest,
+    PasswordChangeRequest,
+    PasswordChangeResponse,
+    TokenResponse,
+    UserOut,
+)
+from backend.utils.security import (
+    BCRYPT_MAX_BYTES,
+    create_access_token,
+    hash_password,
+    verify_password,
+)
 
 settings = get_settings()
 
@@ -88,6 +105,51 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
         expires_in=settings.access_token_expire_minutes * 60,
         user=UserOut.from_user(user),
     )
+
+
+@router.post("/me/password", response_model=PasswordChangeResponse)
+async def change_password(
+    payload: PasswordChangeRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Change your own password, proving you know the current one.
+
+    Any authenticated role: everyone owns their own credential, and no role
+    may change anyone else's here - there is no user id in this route, the
+    same discipline /me/records uses.
+
+    A wrong current password answers 400, NOT 401. The token is valid and the
+    session is alive; the thing that failed is a credential inside the body.
+    Answering 401 would be false, and clients that treat 401 as "session over"
+    - ours does, in frontend/auth.py's bounce_if_unauthorized - would eject
+    the user to the login screen for a typo.
+
+    Not rate limited. Nothing in this application is yet, and an endpoint that
+    checks a password on request is the obvious first place to want it.
+    """
+    if not verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "Current password is incorrect"
+        )
+
+    if payload.new_password == payload.current_password:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "The new password must be different from the current one",
+        )
+
+    # hash_password raises above the bcrypt ceiling; checked here so the caller
+    # gets a sentence instead of a 500.
+    if len(payload.new_password.encode("utf-8")) > BCRYPT_MAX_BYTES:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"The new password is longer than {BCRYPT_MAX_BYTES} bytes, which "
+            "is the most bcrypt accepts",
+        )
+
+    await crud.set_password(db, user.id, hash_password(payload.new_password))
+    return PasswordChangeResponse()
 
 
 @router.get("/me", response_model=UserOut)

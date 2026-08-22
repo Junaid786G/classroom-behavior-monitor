@@ -1244,6 +1244,22 @@ async def get_user(db: AsyncSession, user_id: int) -> Optional[User]:
     return r.scalar_one_or_none()
 
 
+async def set_password(db: AsyncSession, user_id: int, password_hash: str) -> None:
+    """Write a new password hash, and COMMIT before returning.
+
+    Committed here rather than by get_db's teardown for the same reason
+    create_session is: the caller is told the change succeeded and may act on
+    it at once - logging in again with the new password is the obvious next
+    move - and get_db commits after the response has gone out. A client fast
+    enough to re-authenticate in that window would be refused with the
+    credential it was just told to use.
+    """
+    await db.execute(
+        update(User).where(User.id == user_id).values(password_hash=password_hash)
+    )
+    await db.commit()
+
+
 async def touch_last_login(db: AsyncSession, user_id: int) -> None:
     """Stamp a successful login. Committed by get_db when the request ends."""
     await db.execute(
