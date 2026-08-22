@@ -680,6 +680,217 @@ async def get_behavior_breakdown(
     ]
 
 
+async def get_course_overview(db: AsyncSession, course_id: int) -> Optional[dict]:
+    """Every session in a course, with attendance and behaviour rolled up.
+
+    Three aggregate queries, not two per session. 99B alone holds 66 sessions
+    and 204k behaviour events, so rolling this up the way the dashboards do -
+    a summary call plus an analytics call per session - is 132 round trips and
+    132 DB sessions for one page.
+
+    Returns None when the course does not exist, so the router can 404.
+
+    Sessions with no attendance rows are listed but excluded from the
+    attendance roll-up: 24 of 99B's sessions were never processed, and
+    counting a roster's worth of absences for each would report a course-wide
+    attendance rate that never happened.
+    """
+    course = await get_course(db, course_id)
+    if course is None:
+        return None
+
+    # Roster is per COURSE, matching Phase 1's course scoping and the roster
+    # gating in stream.py. Note get_attendance_summary still counts enrolment
+    # per CLASSROOM, so the two can disagree once a course spans rooms.
+    roster_size = (
+        await db.execute(
+            select(func.count())
+            .select_from(Student)
+            .where(Student.course_id == course_id, Student.is_active.is_(True))
+        )
+    ).scalar_one()
+
+    session_rows = (
+        await db.execute(
+            select(
+                Session,
+                Subject.subject_code,
+                Subject.subject_name,
+                Subject.is_active.label("subject_is_active"),
+            )
+            .join(Subject, Subject.id == Session.subject_id)
+            .where(Subject.course_id == course_id)
+            # coalesce so pending sessions (no started_at) sort by creation
+            # instead of dropping to the bottom in an unpredictable order.
+            .order_by(func.coalesce(Session.started_at, Session.created_at).desc())
+        )
+    ).all()
+
+    if not session_rows:
+        return {
+            "course_id": course.id,
+            "course_code": course.code,
+            "course_name": course.name,
+            "roster_size": roster_size,
+            "sessions_total": 0,
+            "sessions_with_attendance": 0,
+            "attendance": {
+                "sessions_counted": 0, "roster_size": roster_size,
+                "present": 0, "late": 0, "absent": 0,
+                "present_rate": 0.0, "late_rate": 0.0, "absent_rate": 0.0,
+            },
+            "behavior_breakdown": [],
+            "avg_attention_score": 0.0,
+            "sessions": [],
+        }
+
+    session_ids = [row[0].id for row in session_rows]
+
+    att_rows = (
+        await db.execute(
+            select(
+                AttendanceRecord.session_id,
+                AttendanceRecord.status,
+                func.count().label("n"),
+            )
+            .where(AttendanceRecord.session_id.in_(session_ids))
+            .group_by(AttendanceRecord.session_id, AttendanceRecord.status)
+        )
+    ).all()
+
+    beh_rows = (
+        await db.execute(
+            select(
+                BehaviorEvent.session_id,
+                BehaviorEvent.behavior_type,
+                func.count().label("cnt"),
+                func.sum(BehaviorEvent.end_ms - BehaviorEvent.start_ms).label("total_ms"),
+                func.avg(BehaviorEvent.confidence).label("avg_conf"),
+            )
+            .where(BehaviorEvent.session_id.in_(session_ids))
+            .group_by(BehaviorEvent.session_id, BehaviorEvent.behavior_type)
+        )
+    ).all()
+
+    att_by_session: Dict[UUID, Dict[AttendanceStatus, int]] = {}
+    for r in att_rows:
+        att_by_session.setdefault(r.session_id, {})[r.status] = r.n
+
+    beh_by_session: Dict[UUID, list] = {}
+    for r in beh_rows:
+        beh_by_session.setdefault(r.session_id, []).append(r)
+
+    # Same definition as SessionAnalytics.avg_attention_score, so a session
+    # reads the same here as it does on its own analytics endpoint.
+    attentive_types = (BehaviorType.ATTENTIVE, BehaviorType.RAISED_HAND)
+
+    sessions: List[dict] = []
+    total_present = total_late = total_absent = 0
+    sessions_counted = 0
+    course_beh: Dict[BehaviorType, dict] = {}
+
+    for session, subject_code, subject_name, subject_is_active in session_rows:
+        counts = att_by_session.get(session.id, {})
+        has_attendance = bool(counts)
+
+        present = counts.get(AttendanceStatus.PRESENT, 0)
+        late = counts.get(AttendanceStatus.LATE, 0)
+        # Mirrors get_attendance_summary: absence is inferred from the roster,
+        # not counted from rows, so a partially-recorded session still reports
+        # the students it never saw.
+        absent = max(0, roster_size - present - late) if has_attendance else 0
+
+        if has_attendance:
+            sessions_counted += 1
+            total_present += present
+            total_late += late
+            total_absent += absent
+
+        session_events = beh_by_session.get(session.id, [])
+        session_total = sum(r.cnt for r in session_events)
+        attention = None
+        if session_total:
+            attention = round(
+                sum(r.cnt for r in session_events if r.behavior_type in attentive_types)
+                / session_total,
+                4,
+            )
+
+        for r in session_events:
+            agg = course_beh.setdefault(
+                r.behavior_type,
+                {"count": 0, "total_duration_ms": 0, "conf_weighted": 0.0},
+            )
+            agg["count"] += r.cnt
+            agg["total_duration_ms"] += int(r.total_ms or 0)
+            agg["conf_weighted"] += float(r.avg_conf or 0.0) * r.cnt
+
+        sessions.append({
+            "session_id": session.id,
+            "subject_id": session.subject_id,
+            "subject_code": subject_code,
+            "subject_name": subject_name,
+            "subject_is_active": subject_is_active,
+            "title": session.title,
+            "instructor": session.instructor,
+            "started_at": session.started_at,
+            "status": session.status,
+            "total_frames_processed": session.total_frames_processed,
+            "has_attendance": has_attendance,
+            "present": present,
+            "late": late,
+            "absent": absent,
+            "attendance_rate": (
+                round((present + late) / roster_size, 4)
+                if has_attendance and roster_size else None
+            ),
+            "avg_attention_score": attention,
+        })
+
+    expected = sessions_counted * roster_size
+    course_total_events = sum(a["count"] for a in course_beh.values())
+
+    breakdown = [
+        {
+            "behavior_type": bt,
+            "count": agg["count"],
+            "total_duration_ms": agg["total_duration_ms"],
+            # Weighted by event count, so a session with three events cannot
+            # pull the course mean as hard as one with thirty thousand.
+            "avg_confidence": round(agg["conf_weighted"] / agg["count"], 4),
+            "percentage": round(agg["count"] / course_total_events * 100, 2),
+        }
+        for bt, agg in sorted(course_beh.items(), key=lambda kv: -kv[1]["count"])
+    ] if course_total_events else []
+
+    avg_attention = (
+        sum(a["count"] for bt, a in course_beh.items() if bt in attentive_types)
+        / course_total_events
+    ) if course_total_events else 0.0
+
+    return {
+        "course_id": course.id,
+        "course_code": course.code,
+        "course_name": course.name,
+        "roster_size": roster_size,
+        "sessions_total": len(sessions),
+        "sessions_with_attendance": sessions_counted,
+        "attendance": {
+            "sessions_counted": sessions_counted,
+            "roster_size": roster_size,
+            "present": total_present,
+            "late": total_late,
+            "absent": total_absent,
+            "present_rate": round(total_present / expected, 4) if expected else 0.0,
+            "late_rate": round(total_late / expected, 4) if expected else 0.0,
+            "absent_rate": round(total_absent / expected, 4) if expected else 0.0,
+        },
+        "behavior_breakdown": breakdown,
+        "avg_attention_score": round(avg_attention, 4),
+        "sessions": sessions,
+    }
+
+
 async def get_unique_faces_count(db: AsyncSession, session_id: UUID) -> int:
     r = await db.execute(
         select(func.count(func.distinct(FaceDetection.track_id)))

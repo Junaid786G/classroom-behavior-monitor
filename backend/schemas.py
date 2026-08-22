@@ -314,6 +314,67 @@ class SessionAnalytics(BaseModel):
     peak_distraction_ms: Optional[int] = None
 
 
+class CourseSessionRow(BaseModel):
+    """One session in a course overview, labelled by its real subject.
+
+    subject_code / subject_name come from the subjects row, not from
+    Session.subject - that free-text column predates the subjects table and
+    still holds whatever the operator typed at the time.
+    """
+    session_id: UUID
+    subject_id: int
+    subject_code: str
+    subject_name: str
+    subject_is_active: bool
+    title: Optional[str] = None
+    instructor: Optional[str] = None
+    started_at: Optional[datetime] = None
+    status: SessionStatus
+    total_frames_processed: int
+    # False when the session has no attendance rows at all - never processed,
+    # as opposed to processed and everyone absent. The two must not look alike.
+    has_attendance: bool
+    present: int
+    late: int
+    absent: int
+    attendance_rate: Optional[float] = None
+    avg_attention_score: Optional[float] = None
+
+
+class CourseAttendanceRollup(BaseModel):
+    """Attendance across a course.
+
+    Counted only over sessions that actually have attendance rows: folding in
+    the unprocessed ones would report a roster's worth of absences for a class
+    that was never recorded.
+
+    `present` here is strictly PRESENT. The per-session endpoint
+    (/sessions/{id}/attendance/summary) bundles LATE into its `present` and
+    also reports it separately; this splits the two.
+    """
+    sessions_counted: int
+    roster_size: int
+    present: int
+    late: int
+    absent: int
+    present_rate: float
+    late_rate: float
+    absent_rate: float
+
+
+class CourseOverview(BaseModel):
+    course_id: int
+    course_code: str
+    course_name: str
+    roster_size: int
+    sessions_total: int
+    sessions_with_attendance: int
+    attendance: CourseAttendanceRollup
+    behavior_breakdown: List[BehaviorBreakdownItem]
+    avg_attention_score: float
+    sessions: List[CourseSessionRow]
+
+
 class AttendanceTrend(BaseModel):
     date: str
     present: int

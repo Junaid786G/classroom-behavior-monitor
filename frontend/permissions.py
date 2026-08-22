@@ -60,6 +60,7 @@ PAGE_ATTENDANCE = "attendance"
 PAGE_STUDENT_DASHBOARD = "student_dashboard"
 PAGE_CLASSROOM_DASHBOARD = "classroom_dashboard"
 PAGE_ADMIN = "admin"
+PAGE_COURSE_OVERVIEW = "course_overview"
 
 PAGE_TITLE = {
     PAGE_HOME: "Home Dashboard",
@@ -68,6 +69,7 @@ PAGE_TITLE = {
     PAGE_STUDENT_DASHBOARD: "Student Dashboard",
     PAGE_CLASSROOM_DASHBOARD: "Classroom Dashboard",
     PAGE_ADMIN: "Admin Panel",
+    PAGE_COURSE_OVERVIEW: "Course Overview",
 }
 
 # ── The policy ────────────────────────────────────────────────────────────────
@@ -104,6 +106,13 @@ PAGE_ACCESS = {
     # courses, subjects, instructor accounts and assignments — which today
     # still lives in scripts/04_add_subject.py.
     PAGE_ADMIN: frozenset({ROLE_INSTRUCTOR}),
+
+    # The first page of the HOD portal: "department-wide analytics, attendance
+    # and behaviour reports across all courses" (models.py UserRole). Read-only
+    # by construction - it renders no control that writes. INSTRUCTOR is absent
+    # deliberately: the page rolls up every session in a course whoever taught
+    # it, which is the oversight view, not the teaching one.
+    PAGE_COURSE_OVERVIEW: frozenset({ROLE_HOD}),
 }
 
 # Roles permitted to CHANGE attendance, as opposed to reading it. HOD is

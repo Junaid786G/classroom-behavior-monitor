@@ -7,18 +7,46 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend import crud
 from backend.database import get_db
-from backend.deps import require_instructor, require_session_access
+from backend.deps import require_hod, require_instructor, require_session_access
 from backend.schemas import (
     AlertAcknowledge,
     AlertOut,
     BehaviorBreakdownItem,
     BehaviorEventOut,
     BehaviorEventWithStudent,
+    CourseOverview,
     Page,
     SessionAnalytics,
 )
 
 router = APIRouter(tags=["analytics"])
+
+
+# ── Course roll-up ────────────────────────────────────────────────────────────
+
+# HOD only. This is department-wide oversight by definition - it reads every
+# session in a course regardless of who taught it, which is exactly what an
+# instructor must not have. Serving instructors a scoped version means
+# filtering to their assigned subjects, which is a different response and a
+# separate change.
+@router.get(
+    "/courses/{course_id}/overview",
+    response_model=CourseOverview,
+    dependencies=[Depends(require_hod)],
+)
+async def course_overview(
+    course_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Attendance and behaviour rolled up across every session in a course.
+
+    Exists because the alternative is 2 requests per session: the per-session
+    endpoints answer one session each, and a semester of 99B is 66 of them.
+    """
+    data = await crud.get_course_overview(db, course_id)
+    if data is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Course not found")
+    return CourseOverview(**data)
 
 
 # ── Session analytics ─────────────────────────────────────────────────────────
