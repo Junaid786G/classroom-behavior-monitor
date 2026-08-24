@@ -59,6 +59,26 @@ html, body,
   color: var(--text-hi) !important;
 }
 
+/* Streamlit draws chevrons, close buttons and collapse controls as Material
+   Symbols LIGATURES: the span's text really is "keyboard_arrow_right", and
+   the icon font is what turns it into a glyph. The blanket font override
+   above hits those spans too, so the ligature name renders as literal text
+   ("_arrow_right" colliding with an expander label). Restore the icon font.
+
+   The selectors are two levels deep on purpose. At equal specificity the
+   `*` rule above wins - it is later in this file - so a bare
+   [data-testid="stIconMaterial"] silently does nothing.
+
+   Streamlit 1.35, which Dockerfile.frontend pins, does not render icons this
+   way, so this is inert there and only matters on newer local installs. */
+[data-testid="stSidebar"] [data-testid="stIconMaterial"],
+[data-testid="stAppViewContainer"] [data-testid="stIconMaterial"],
+[data-testid="stIconMaterial"] {
+  font-family: "Material Symbols Rounded" !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+}
+
 [data-testid="stSidebarNav"] a {
   border-left: 2px solid transparent;
   transition: all 0.2s;
