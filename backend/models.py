@@ -167,6 +167,17 @@ class Course(TimestampMixin, Base):
         return f"<Course id={self.id} code={self.code!r}>"
 
 
+# Reserved for the pre-migration history bucket created by
+# scripts/03_migrate_multicourse.py. That row is deliberately is_active=FALSE
+# and must never become a selectable subject or be assigned to anyone.
+#
+# Lives here, beside the table it constrains, because three separate places now
+# enforce it: scripts/04_add_subject.py, scripts/05_add_user.py and the
+# TRAINING_CONTROL write routes. They each used to carry their own copy of this
+# set, which is one edit away from disagreeing.
+RESERVED_SUBJECT_CODES = frozenset({"LEGACY-CS"})
+
+
 class Subject(TimestampMixin, Base):
     """One subject taught within one course.
 

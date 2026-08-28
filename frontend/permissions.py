@@ -10,13 +10,18 @@ the same policy instead. PAGE_ACCESS below is deliberately shaped like the
 argument lists you would hand require_role(...), so gating the routers later is
 transcription rather than redesign.
 
-SCOPE — THIS IS UI VISIBILITY, NOT ACCESS CONTROL
-=================================================
-No backend router is gated yet, so every API endpoint remains open to anyone
-who can reach the backend directly; `curl /api/v1/students` works with no token
-regardless of what this file says. Hiding a page hides the page, not the data
-behind it. This becomes real enforcement only when backend/deps.py is wired
-into the routers.
+SCOPE — THIS IS UI VISIBILITY, AND IT IS THE WEAKER OF THE TWO LOCKS
+====================================================================
+Hiding a page hides the page, never the data behind it. What actually refuses a
+request is backend/deps.py, which IS now wired into the routers — stream,
+catalog, students, attendance, analytics and users all carry require_* on their
+routes. So this file and that one have to agree, and where they disagree the
+backend wins: a page shown in error renders empty or errors, which is ugly; a
+route gated in error would be a hole.
+
+Treat an entry added here as a claim that the matching routes are gated there.
+For PAGE_TRAINING_CONTROL, the newest entry, that pairing is exact — see the
+comment on it below.
 
 DEFAULT DENY
 ============
@@ -62,6 +67,7 @@ PAGE_CLASSROOM_DASHBOARD = "classroom_dashboard"
 PAGE_ADMIN = "admin"
 PAGE_COURSE_OVERVIEW = "course_overview"
 PAGE_STUDENT_PORTAL = "student_portal"
+PAGE_TRAINING_CONTROL = "training_control"
 
 PAGE_TITLE = {
     PAGE_HOME: "Home Dashboard",
@@ -72,6 +78,7 @@ PAGE_TITLE = {
     PAGE_ADMIN: "Admin Panel",
     PAGE_COURSE_OVERVIEW: "Course Overview",
     PAGE_STUDENT_PORTAL: "My Records",
+    PAGE_TRAINING_CONTROL: "Training Control",
 }
 
 # ── The policy ────────────────────────────────────────────────────────────────
@@ -104,9 +111,9 @@ PAGE_ACCESS = {
 
     # models.py is explicit that this belongs to INSTRUCTOR, not to the
     # setup role: "Deliberately NOT named 'admin': the Admin panel belongs to
-    # INSTRUCTOR." TRAINING_CONTROL gets its own setup UI when one exists —
-    # courses, subjects, instructor accounts and assignments — which today
-    # still lives in scripts/04_add_subject.py.
+    # INSTRUCTOR." TRAINING_CONTROL has its own setup UI — see
+    # PAGE_TRAINING_CONTROL below — and is absent here for the same reason
+    # INSTRUCTOR is absent there: they are two different jobs.
     PAGE_ADMIN: frozenset({ROLE_INSTRUCTOR}),
 
     # The first page of the HOD portal: "department-wide analytics, attendance
@@ -122,6 +129,19 @@ PAGE_ACCESS = {
     # matters is server-side: /me/records reads linked_student_id off the
     # authenticated row and takes no student id from the caller.
     PAGE_STUDENT_PORTAL: frozenset({ROLE_STUDENT}),
+
+    # The setup portal: subjects, instructor accounts, and the assignments
+    # between them. TRAINING_CONTROL alone, and that is the whole role —
+    # models.py: "setup only ... No video monitoring, no gallery or threshold
+    # access, no analytics dashboards."
+    #
+    # Unlike every other entry here, this one is NOT ui-visibility-only. The
+    # routes behind it (POST /courses/{id}/subjects, PATCH /subjects/{id},
+    # /users*) are gated server-side by require_training_control, so hiding
+    # the page and refusing the write are two independent locks. An instructor
+    # who types the URL gets the refusal below; one who calls the API directly
+    # gets a 403 from backend/deps.py.
+    PAGE_TRAINING_CONTROL: frozenset({ROLE_TRAINING_CONTROL}),
 }
 
 # Roles permitted to CHANGE attendance, as opposed to reading it. HOD is
@@ -129,10 +149,15 @@ PAGE_ACCESS = {
 # contradict the role definition by handing them the Manual Override.
 ATTENDANCE_WRITERS = frozenset({ROLE_INSTRUCTOR})
 
-# KNOWN GAP, ACCEPTED FOR NOW: STUDENT and TRAINING_CONTROL can reach only the
-# Home page, because the pages that would serve them do not exist yet — a
-# student-scoped record view, and a course/subject/instructor setup UI. That is
-# an honest empty state rather than a page that shows them other people's data.
+# The gap recorded here — STUDENT and TRAINING_CONTROL reaching nothing but Home
+# — is closed: PAGE_STUDENT_PORTAL serves the first, PAGE_TRAINING_CONTROL the
+# second. Every role now has at least one page of its own.
+#
+# WHAT IS STILL MISSING, and is a deliberate scope line rather than an oversight:
+# TRAINING_CONTROL's role definition includes creating and editing COURSES, and
+# the portal only does subjects. No API write exists for courses either — the
+# five courses were created by 03_migrate_multicourse.py and none has needed to
+# change since.
 
 
 # ── Queries ───────────────────────────────────────────────────────────────────

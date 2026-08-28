@@ -1,13 +1,42 @@
 # ────────────────────────────────────────────────────────────────────────────
-# Classroom CCTV Monitor – Backend Dockerfile
+# Classroom CCTV Monitor – Backend Dockerfile (CPU)
 #
-# GPU variant: swap the FROM line for:
-#   FROM nvidia/cuda:12.3.1-cudnn8-runtime-ubuntu22.04
-# and also replace onnxruntime → onnxruntime-gpu in requirements.txt.
+# Two-stage build. insightface 0.7.3 compiles a Cython C++ extension
+# (thirdparty/face3d/mesh_core_cython) from source — there is no manylinux
+# wheel — so a C++ toolchain is mandatory at install time. Building in a
+# separate stage and copying only the finished virtualenv keeps g++ and the
+# ~250 MB of build headers out of the shipped image.
+#
+# GPU variant: see Dockerfile.backend.gpu + docker-compose.gpu.yml.
 # ────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: compile dependencies ───────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        g++ \
+        gcc \
+        python3-dev \
+        && rm -rf /var/lib/apt/lists/*
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /build
+COPY requirements.txt .
+
+# numpy and Cython must already be importable: insightface's setup.py imports
+# both at build time, before pip resolves them as ordinary dependencies.
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir numpy==1.26.4 Cython==3.0.10 && \
+    pip install --no-cache-dir -r requirements.txt
+
+# ── Stage 2: runtime ────────────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
 
-# System packages needed by OpenCV, MediaPipe, InsightFace
+# System packages needed by OpenCV, MediaPipe, InsightFace at *run* time.
+# libstdc++6 is what the compiled insightface extension links against.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
@@ -15,31 +44,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxext6 \
         libxrender1 \
         libgomp1 \
+        libstdc++6 \
         libgstreamer1.0-0 \
         curl \
         && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Install Python deps (cached layer – invalidated only when requirements change)
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+WORKDIR /app
 
 # Copy application source
 COPY backend/   ./backend/
 COPY scripts/   ./scripts/
 COPY .env.example .env
 
-# Data directories (bind-mounted at runtime; created here for standalone use)
+# Data directories (bind-mounted at runtime; created here for standalone use).
+# models/ is bind-mounted read-only from the host — see scripts/00_fetch_models.py.
 RUN mkdir -p data/videos/enrollment \
              data/student_photos \
              data/embeddings_cache \
+             models \
              logs
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    MODELS_PATH=/app/models
 
 EXPOSE 8000
 

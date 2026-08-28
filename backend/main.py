@@ -16,7 +16,15 @@ from backend.pipeline.behavior import get_behavior_analyzer
 from backend.pipeline.detector import get_detector
 from backend.pipeline.embedder import get_embedder
 from backend.pipeline.tracker import get_tracker
-from backend.routers import analytics, attendance, auth, catalog, stream, students
+from backend.routers import (
+    analytics,
+    attendance,
+    auth,
+    catalog,
+    stream,
+    students,
+    users,
+)
 from backend.utils.gpu import get_device_info
 from backend.utils.logger import setup_logging
 
@@ -149,6 +157,7 @@ app.include_router(catalog.router,    prefix="/api/v1")
 app.include_router(students.router,   prefix="/api/v1")
 app.include_router(attendance.router, prefix="/api/v1")
 app.include_router(analytics.router,  prefix="/api/v1")
+app.include_router(users.router,      prefix="/api/v1")
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

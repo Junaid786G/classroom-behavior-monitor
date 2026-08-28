@@ -1,0 +1,107 @@
+# ────────────────────────────────────────────────────────────────────────────
+# Classroom CCTV Monitor – Backend Dockerfile (NVIDIA GPU variant)
+#
+# Mirrors Dockerfile.backend, but on a CUDA 12.2 + cuDNN 8 base with
+# onnxruntime-gpu, so InsightFace / ArcFace and the eye-state ONNX run on the
+# GPU via the CUDAExecutionProvider.
+#
+# Two-stage for the same reason as the CPU image: insightface 0.7.3 compiles a
+# Cython C++ extension from source and needs a toolchain at install time.
+#
+# Requires on the host: NVIDIA driver >= 535 and nvidia-container-toolkit.
+# Build:  docker compose -f docker-compose.yml -f docker-compose.gpu.yml build backend
+# ────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: compile dependencies ───────────────────────────────────────────
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Ubuntu 22.04 ships Python 3.10; the project targets 3.11 (deadsnakes).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common gnupg ca-certificates \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-dev \
+        build-essential g++ gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.11 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /build
+COPY requirements.txt requirements-gpu.txt ./
+
+# Same ordering constraint as the CPU image: insightface's setup.py imports
+# numpy and Cython at build time. The CPU onnxruntime pin is filtered out so it
+# can never shadow onnxruntime-gpu.
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir numpy==1.26.4 Cython==3.0.10 && \
+    grep -v '^onnxruntime==' requirements.txt > /tmp/requirements-nocpu.txt && \
+    pip install --no-cache-dir -r /tmp/requirements-nocpu.txt && \
+    pip install --no-cache-dir -r requirements-gpu.txt && \
+    rm /tmp/requirements-nocpu.txt
+
+# Fail the build if the CPU runtime survived — having both installed makes ONNX
+# Runtime silently pick CPU, which is the exact bug this image exists to avoid.
+RUN python - <<'PY'
+import importlib.metadata as md
+installed = {d.metadata["Name"].lower() for d in md.distributions()}
+assert "onnxruntime-gpu" in installed, "onnxruntime-gpu missing"
+assert "onnxruntime" not in installed, "CPU onnxruntime present alongside GPU build"
+print("onnxruntime-gpu", md.version("onnxruntime-gpu"), "OK")
+PY
+
+# ── Stage 2: runtime ────────────────────────────────────────────────────────
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common gnupg ca-certificates \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libgomp1 \
+        libstdc++6 \
+        libgstreamer1.0-0 \
+        curl \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && apt-get purge -y software-properties-common \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+COPY backend/   ./backend/
+COPY scripts/   ./scripts/
+COPY .env.example .env
+
+RUN mkdir -p data/videos/enrollment \
+             data/student_photos \
+             data/embeddings_cache \
+             models \
+             logs
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    MODELS_PATH=/app/models \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "1", "--loop", "asyncio"]

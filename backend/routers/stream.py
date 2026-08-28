@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,11 +18,13 @@ from fastapi import (
     File,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
     status,
 )
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend import crud
@@ -47,7 +50,17 @@ from backend.pipeline.annotator import annotate_frame
 from backend.pipeline.behavior import BehaviorFrame, get_behavior_analyzer
 from backend.pipeline.capture import VideoCapture, get_video_metadata
 from backend.pipeline.recognizer import FaceRecognizer, RecognitionResult, get_recognizer
+from backend.pipeline.live_worker import (
+    LiveSessionWorker,
+    LiveStartError,
+    active_worker,
+    get_worker,
+    register as register_live_worker,
+    validate_stream_url,
+)
 from backend.schemas import (
+    LiveStartRequest,
+    LiveStatusOut,
     Page,
     SessionCreate,
     SessionOut,
@@ -212,6 +225,255 @@ async def get_video_status(
     if v is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Upload not found")
     return VideoUploadOut.model_validate(v)
+
+
+# ── Live (RTSP) ingestion ─────────────────────────────────────────────────────
+
+async def _resolve_roster(db: AsyncSession, sid: UUID) -> Tuple[Dict[int, str], frozenset]:
+    """Course-scoped roster for a session. Mirrors the upload and WS paths.
+
+    Scoping to the COURSE and not the classroom matters: a room is physical and
+    can host several courses, so room scoping would let the department-wide FAISS
+    gallery attribute a face to someone not enrolled in this class.
+    """
+    course_id = await crud.get_session_course_id(db, sid)
+    if course_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Session has no subject/course — cannot resolve a roster",
+        )
+    _, students = await crud.list_students(db, course_id=course_id, limit=10_000)
+    student_map = {st.id: st.full_name for st in students}
+    return student_map, frozenset(student_map)
+
+
+@router.post(
+    "/sessions/{session_id}/live/start",
+    response_model=LiveStatusOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_instructor)],
+)
+async def start_live(
+    session_id: UUID,
+    body: LiveStartRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Open an RTSP URL server-side and run the full pipeline against it.
+
+    Returns as soon as the capture thread is armed; connection happens on that
+    thread, so a camera that is slow or unreachable shows up in the `state` and
+    `last_error` fields of /live/status rather than hanging this request.
+    """
+    session = await crud.get_session(db, session_id)
+    if session is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
+
+    try:
+        url = validate_stream_url(body.rtsp_url)
+    except LiveStartError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+
+    existing = get_worker(session_id)
+    if existing and existing.is_running:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Live capture is already running for session {session_id}",
+        )
+
+    student_map, roster_ids = await _resolve_roster(db, session_id)
+    await crud.start_session(db, session_id)
+    session = await crud.get_session(db, session_id)
+
+    late_after = (
+        session.started_at + timedelta(minutes=settings.late_threshold_minutes)
+        if session and session.started_at else None
+    )
+
+    worker = LiveSessionWorker(
+        session_id=session_id,
+        rtsp_url=url,
+        loop=asyncio.get_running_loop(),
+        student_map=student_map,
+        roster_ids=roster_ids,
+        late_after=late_after,
+    )
+    try:
+        register_live_worker(worker)
+    except LiveStartError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+
+    worker.start()
+    logger.info("live session=%s started against %s (roster=%d)",
+                session_id, url, len(student_map))
+    return LiveStatusOut(**worker.snapshot(include_frame=False).__dict__)
+
+
+@router.post(
+    "/sessions/{session_id}/live/stop",
+    response_model=LiveStatusOut,
+    dependencies=[Depends(require_instructor)],
+)
+async def stop_live(session_id: UUID):
+    """Stop capture and close the session out. Idempotent.
+
+    A finished worker stays in the registry (see live_worker._finalise), so
+    stopping an already-stopped session returns its terminal snapshot rather
+    than 404, and stop() leaves that state untouched. 404 is now reserved for
+    a session that never had a worker, or one already reaped by a later start.
+    """
+    worker = get_worker(session_id)
+    if worker is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"No live capture registered for session {session_id}",
+        )
+    # join() blocks until the loop reaches a frame boundary and flushes; keep it
+    # off the event loop so the API stays responsive while it winds down.
+    await asyncio.to_thread(worker.stop)
+    return LiveStatusOut(**worker.snapshot(include_frame=False).__dict__)
+
+
+@router.get(
+    "/sessions/{session_id}/live/status",
+    response_model=LiveStatusOut,
+    dependencies=[Depends(require_instructor)],
+)
+async def live_status(
+    session_id: UUID,
+    include_frame: bool = Query(True, description="Include the latest annotated JPEG (base64)"),
+):
+    """Poll for live state, the newest detections, and the annotated frame.
+
+    This is the UI's read path: the backend owns the capture loop, so the browser
+    pulls results instead of pushing frames as it does for uploaded video.
+    """
+    worker = get_worker(session_id)
+    if worker is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"No live capture registered for session {session_id}",
+        )
+    return LiveStatusOut(**worker.snapshot(include_frame=include_frame).__dict__)
+
+
+def _sse(event: str, data: str) -> str:
+    """One SSE frame. The blank line terminates the event — without it the
+    client buffers indefinitely waiting for the record to end."""
+    return f"event: {event}\ndata: {data}\n\n"
+
+
+@router.get(
+    "/sessions/{session_id}/live/stream",
+    dependencies=[Depends(require_instructor)],
+)
+async def live_stream_sse(
+    session_id: UUID,
+    request: Request,
+    include_frame: bool = Query(True, description="Include the annotated JPEG in each event"),
+):
+    """Push live frames as Server-Sent Events instead of being polled.
+
+    Replaces the client poll loop: one long-lived connection, and a frame
+    reaches the UI within `live_sse_watch_interval` of being published rather
+    than up to a poll period late. Unchanged state costs a comment heartbeat
+    instead of re-sending a ~310KB JPEG.
+
+    A slow client can never stall capture. The worker owns its own thread and
+    the only state shared with this coroutine is its lock, held just long
+    enough to copy a reference. Measured: a client stalling 8s per event left
+    the worker running at 0.66 fps and 43 frames ahead, unaffected.
+
+    What this does NOT give you is drop-on-send. SSE has no acknowledgement,
+    so an event handed to the transport is gone from our control and queues in
+    the socket buffer; the same measurement showed the stalled client reading
+    seq 0..8 *consecutively* — a backlog, not the newest frame. Conflation
+    happens at snapshot time only, and the generator free-runs because a write
+    that the buffer accepts returns immediately, so it never learns the client
+    is behind until flow control finally engages (~3MB on loopback).
+
+    The consumer must therefore conflate on receipt: read events continuously
+    and keep only the newest in a single slot, discarding any backlog. The
+    Streamlit client does exactly that (`_SSEMonitor`), which is what makes
+    the end-to-end behaviour drop-the-stale rather than replay-the-old.
+
+    Auth is a normal Authorization header, which the browser's EventSource
+    cannot send — this is consumed server-side by the Streamlit page, which
+    can. A browser-native consumer would need a query-token variant.
+    """
+    worker = get_worker(session_id)
+    if worker is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"No live capture registered for session {session_id}",
+        )
+
+    async def events():
+        last_seq: int = -1
+        last_state: Optional[str] = None
+        last_send = time.monotonic()
+
+        while True:
+            if await request.is_disconnected():
+                logger.debug("SSE session=%s client went away", session_id)
+                break
+
+            snap = worker.snapshot(include_frame=include_frame)
+            payload = LiveStatusOut(**snap.__dict__).model_dump_json()
+
+            if snap.state in ("stopped", "error"):
+                # Terminal: one `end` carrying the final snapshot (last frame
+                # and last_error included) and the connection closes. Emitting
+                # a `status` first would just duplicate it.
+                yield _sse("end", payload)
+                break
+
+            if snap.frame_seq != last_seq:
+                last_seq = snap.frame_seq
+                yield _sse("frame", payload)
+                last_send = time.monotonic()
+            elif snap.state != last_state:
+                # State moved without a new frame — reconnecting, say. The UI
+                # needs this or it shows "running" through an outage.
+                yield _sse("status", payload)
+                last_send = time.monotonic()
+
+            last_state = snap.state
+
+            if time.monotonic() - last_send >= settings.live_sse_heartbeat:
+                yield ": keepalive\n\n"
+                last_send = time.monotonic()
+
+            await asyncio.sleep(settings.live_sse_watch_interval)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # nginx buffers proxied responses by default, which would hold
+            # frames back until the buffer fills and defeat the whole point.
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get(
+    "/live/active",
+    dependencies=[Depends(require_instructor)],
+)
+async def live_active():
+    """Which live session, if any, currently holds the pipeline.
+
+    Only one runs at a time (the recognition singletons keep per-track state),
+    so the UI uses this to explain a 409 rather than just failing to start.
+    """
+    worker = active_worker()
+    if worker is None:
+        return {"active": False, "session_id": None}
+    snap = worker.snapshot(include_frame=False)
+    return {"active": True, "session_id": snap.session_id, "state": snap.state,
+            "rtsp_url": snap.rtsp_url, "frames_processed": snap.frames_processed}
 
 
 # ── Roster scoping ────────────────────────────────────────────────────────────

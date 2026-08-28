@@ -19,10 +19,11 @@ import mediapipe as mp
 import numpy as np
 import pytest
 
+from backend.config import get_settings
 from backend.pipeline.behavior import _LEFT_EYE, _RIGHT_EYE
 from backend.pipeline.eye_classifier import EyeStateClassifier, _MODEL_PATH
 
-_LANDMARKER = "/home/muhammadjunaidmalik/classroom_monitor/models/face_landmarker.task"
+_LANDMARKER = str(get_settings().face_landmarker_path)
 _PHOTOS_DIR = Path("data/student_photos")
 
 pytestmark = pytest.mark.skipif(

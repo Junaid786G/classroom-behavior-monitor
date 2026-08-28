@@ -3,6 +3,7 @@ Student Dashboard – Page 3
 Per-student behavioural analytics, attention timelines, and session history.
 """
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -123,6 +124,70 @@ def _timeline(user_id: int, session_id: str):
     return d.get("timeline", [])
 
 
+@st.cache_data(ttl=60)
+def _course_subject_ids(user_id: int, course_id: int) -> set:
+    """Subject ids belonging to one course.
+
+    /sessions returns subject_id but not course_id, and StudentOut gives us the
+    student's course - this bridges the two so we can tell whether a running
+    session belongs to the selected student's course. Cached longer than the
+    session lists: a course's subject set does not change mid-lecture.
+    """
+    d = _get(f"/courses/{course_id}/subjects") or {}
+    return {s["id"] for s in d.get("items", [])}
+
+
+def _behavior_events_live(session_id: str, student_id: int) -> list:
+    """Uncached behaviour fetch for a session that is still being written.
+
+    Deliberately NOT @st.cache_data: the cached sibling above holds for 10s,
+    which would stall a 3s poll for two refreshes out of every three.
+    """
+    d = _get(
+        f"/sessions/{session_id}/behavior",
+        params={"student_id": student_id, "limit": 500},
+    ) or {}
+    return d.get("items", [])
+
+
+def _behaviour_donut(events: list) -> None:
+    """The behaviour split donut.
+
+    Extracted so the live and completed paths render identically rather than
+    drifting apart.
+    """
+    from collections import Counter
+    counts = Counter(e["behavior_type"] for e in events)
+    labels = list(counts.keys())
+    values = list(counts.values())
+    colors = [_BEHAVIOR_PALETTE.get(l, "#3d5a6b") for l in labels]
+
+    fig_pie = go.Figure(go.Pie(
+        labels=[l.replace("_", " ").title() for l in labels],
+        values=values,
+        hole=0.5,
+        marker=dict(colors=colors, line=dict(color="#0f1923", width=2)),
+        textinfo="label+percent",
+        textfont=dict(family="Share Tech Mono", size=10, color="#c8d6e5"),
+    ))
+    total_events = sum(values)
+    attentive_n  = counts.get("attentive", 0) + counts.get("raised_hand", 0)
+    attn_pct     = attentive_n / total_events if total_events else 0
+    fig_pie.update_layout(
+        **_layout(
+            title=dict(text="Behaviour Split", font=dict(color="#00d4ff", size=13)),
+            showlegend=False,
+            annotations=[dict(
+                text=f"<b>{attn_pct:.0%}</b><br>attn",
+                x=0.5, y=0.5,
+                font=dict(size=18, color="#00ff88", family="Orbitron"),
+                showarrow=False,
+            )],
+        )
+    )
+    st.plotly_chart(fig_pie, use_container_width=True)
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<p class="section-label">▸ Student</p>', unsafe_allow_html=True)
@@ -138,6 +203,27 @@ with st.sidebar:
     st.divider()
     st.markdown('<p class="section-label">▸ Session</p>', unsafe_allow_html=True)
     sessions = _sessions(cache_user_id())
+
+    # A PROCESSING session in this student's course takes precedence over the
+    # completed picker below: behavior_events are being written to it right now.
+    # /sessions is already role-scoped server-side; the subject-id set narrows it
+    # to the selected student's course. Sessions come back created_at DESC, so
+    # the first match is the most recent live one.
+    _stu_row     = next((s for s in students if s["id"] == student_id), {})
+    _course_id   = _stu_row.get("course_id")
+    _subject_ids = _course_subject_ids(cache_user_id(), _course_id) if _course_id else set()
+    active_session = next(
+        (s for s in sessions
+         if s.get("status") == "processing" and s.get("subject_id") in _subject_ids),
+        None,
+    )
+    active_session_id = active_session["id"] if active_session else None
+    if active_session:
+        st.success(
+            f"\U0001F534 LIVE - "
+            f"{active_session.get('title') or active_session.get('subject') or 'session'}"
+        )
+
     completed = [s for s in sessions if s.get("status") == "completed"]
     if completed:
         sess_map = {
@@ -194,43 +280,30 @@ col_a, col_b = st.columns([2, 3], gap="large")
 with col_a:
     st.markdown('<p class="section-label">▸ Behaviour Breakdown</p>', unsafe_allow_html=True)
 
-    if session_id:
+    if active_session_id:
+        # Poll in a fragment so ONLY this panel reruns. A page-level st.rerun
+        # every 3s would re-fetch attendance and redraw every chart on the page.
+        @st.fragment(run_every=3)
+        def _live_behaviour() -> None:
+            events = _behavior_events_live(active_session_id, student_id)
+            st.caption(
+                f"\U0001F534 live \u00b7 {len(events)} event(s) \u00b7 "
+                f"updated {datetime.now():%H:%M:%S}"
+            )
+            if events:
+                _behaviour_donut(events)
+            else:
+                st.info("Session is live - no behaviour events for this student yet.")
+
+        _live_behaviour()
+    elif session_id:
         events = _behavior_events(cache_user_id(), session_id, student_id)
         if events:
-            from collections import Counter
-            counts = Counter(e["behavior_type"] for e in events)
-            labels = list(counts.keys())
-            values = list(counts.values())
-            colors = [_BEHAVIOR_PALETTE.get(l, "#3d5a6b") for l in labels]
-
-            fig_pie = go.Figure(go.Pie(
-                labels=[l.replace("_", " ").title() for l in labels],
-                values=values,
-                hole=0.5,
-                marker=dict(colors=colors, line=dict(color="#0f1923", width=2)),
-                textinfo="label+percent",
-                textfont=dict(family="Share Tech Mono", size=10, color="#c8d6e5"),
-            ))
-            total_events = sum(values)
-            attentive_n  = counts.get("attentive", 0) + counts.get("raised_hand", 0)
-            attn_pct     = attentive_n / total_events if total_events else 0
-            fig_pie.update_layout(
-                **_layout(
-                    title=dict(text="Behaviour Split", font=dict(color="#00d4ff", size=13)),
-                    showlegend=False,
-                    annotations=[dict(
-                        text=f"<b>{attn_pct:.0%}</b><br>attn",
-                        x=0.5, y=0.5,
-                        font=dict(size=18, color="#00ff88", family="Orbitron"),
-                        showarrow=False,
-                    )],
-                )
-            )
-            st.plotly_chart(fig_pie, use_container_width=True)
+            _behaviour_donut(events)
         else:
             st.info("No behaviour events for this student in this session.")
     else:
-        st.info("Select a completed session to see behaviour.")
+        st.info("No live session in this course, and no completed session selected.")
 
     st.divider()
 

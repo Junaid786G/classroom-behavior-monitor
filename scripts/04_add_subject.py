@@ -5,8 +5,11 @@
     python scripts/04_add_subject.py --list
     python scripts/04_add_subject.py --course 99B --code AVN101 --name "Avionics Fundamentals"
 
-Interim tool. Subject management moves to the Phase 2 Admin UI under the
-TRAINING_CONTROL role; this stays useful afterwards for scripted / bulk setup.
+Subject management now also lives in the Training Control portal
+(frontend/pages/8_training_control.py, POST /courses/{id}/subjects). This stays
+the path for scripted / bulk setup, and the two enforce the same rules from the
+same source - see RESERVED_SUBJECT_CODES below. The portal can also RENAME and
+ARCHIVE a subject, which this script has never been able to do.
 
 Idempotent: re-adding an existing (course, subject_code) pair is a no-op.
 Subject codes are unique PER COURSE, so the same code may be used in 99B and
@@ -29,6 +32,9 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.config import get_settings
 from backend.database import check_connection
+# One definition, shared with scripts/05 and the TRAINING_CONTROL write routes
+# in backend/routers/. It used to be a local copy in each of the three.
+from backend.models import RESERVED_SUBJECT_CODES
 
 settings = get_settings()
 
@@ -39,10 +45,6 @@ def ok(m):   print(f"  {_G}✓{_RS} {m}")
 def err(m):  print(f"  {_R}✗{_RS} {m}"); sys.exit(1)
 def warn(m): print(f"  {_Y}!{_RS} {m}")
 def info(m): print(f"  {_C}▸{_RS} {m}")
-
-# Reserved for the pre-migration history bucket created by 03_migrate_multicourse.
-# It is deliberately is_active=FALSE and must never become a selectable subject.
-RESERVED_CODES = {"LEGACY-CS"}
 
 
 async def show_catalog(conn) -> None:
@@ -119,7 +121,7 @@ async def main(args) -> None:
                 return
 
             code = args.code.strip().upper()
-            if code in RESERVED_CODES:
+            if code in RESERVED_SUBJECT_CODES:
                 err(
                     f"{code!r} is reserved for pre-migration history and must stay archived.\n"
                     f"    Choose a different subject code."

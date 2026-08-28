@@ -26,15 +26,19 @@ from backend.models import (
     Student,
     Subject,
     User,
+    UserRole,
     VideoStatus,
     VideoUpload,
 )
 from backend.schemas import (
     ClassroomCreate,
     ClassroomUpdate,
+    InstructorCreate,
     SessionCreate,
     StudentCreate,
     StudentUpdate,
+    SubjectCreate,
+    SubjectUpdate,
 )
 
 _now = lambda: datetime.now(timezone.utc)
@@ -221,6 +225,64 @@ async def list_subjects(
     return list(r.scalars().all())
 
 
+async def get_subject_by_code(
+    db: AsyncSession, course_id: int, subject_code: str
+) -> Optional[Subject]:
+    """Look up one subject by its code WITHIN a course.
+
+    Not globally: subject_code is unique per course (uq_subjects_course_code),
+    so a bare code identifies nothing on its own.
+    """
+    r = await db.execute(
+        select(Subject).where(
+            Subject.course_id == course_id, Subject.subject_code == subject_code
+        )
+    )
+    return r.scalar_one_or_none()
+
+
+async def create_subject(
+    db: AsyncSession, course_id: int, data: SubjectCreate
+) -> Subject:
+    """Add one subject to a course. Always active on creation.
+
+    The caller is responsible for the two checks this cannot make: that the
+    course exists, and that the code is not in RESERVED_SUBJECT_CODES. A
+    duplicate (course_id, subject_code) is left to uq_subjects_course_code, and
+    the route turns it into a 409 rather than pre-checking - a pre-check would
+    still race, the constraint would not.
+    """
+    subject = Subject(
+        course_id=course_id,
+        subject_code=data.subject_code,
+        subject_name=data.subject_name,
+        is_active=True,
+    )
+    db.add(subject)
+    await db.flush()
+    await db.refresh(subject)
+    return subject
+
+
+async def update_subject(
+    db: AsyncSession, subject_id: int, data: SubjectUpdate
+) -> Optional[Subject]:
+    """Rename or (un)archive one subject. Returns None if it does not exist.
+
+    exclude_unset, not exclude_none: `is_active: false` and an omitted
+    is_active are different requests, and only the second should leave the flag
+    alone.
+    """
+    values = data.model_dump(exclude_unset=True)
+    if not values:
+        return await get_subject(db, subject_id)
+    await db.execute(
+        update(Subject).where(Subject.id == subject_id).values(**values)
+    )
+    await db.flush()
+    return await get_subject(db, subject_id)
+
+
 # ── Session ───────────────────────────────────────────────────────────────────
 
 async def create_session(db: AsyncSession, data: SessionCreate) -> Session:
@@ -362,14 +424,19 @@ async def reconcile_absent_students(
     session_id: UUID,
 ) -> int:
     """Insert ABSENT attendance rows for every enrolled student not yet seen in this session."""
-    session = await get_session(db, session_id)
-    if session is None:
+    # Scope to the session's COURSE roster, not its room. students.classroom_id
+    # is nullable while students.course_id is not, so the old room-based filter
+    # matched nothing for any student with no room assigned and wrote no ABSENT
+    # rows at all. Course scoping also matches the roster the recognition path
+    # uses, so the two cannot disagree about who was enrolled.
+    course_id = await get_session_course_id(db, session_id)
+    if course_id is None:  # session does not exist
         return 0
     all_students = (
         await db.execute(
             select(Student).where(
-                Student.classroom_id == session.classroom_id,
-                Student.is_active == True,
+                Student.course_id == course_id,
+                Student.is_active.is_(True),
             )
         )
     ).scalars().all()
@@ -1270,3 +1337,111 @@ async def touch_last_login(db: AsyncSession, user_id: int) -> None:
     await db.execute(
         update(User).where(User.id == user_id).values(last_login_at=_now())
     )
+
+
+# _USER_LOADS reaches the assignment rows, which is all a token claim needs -
+# it is ids. A screen showing "who teaches what" needs the course and subject
+# behind each id, and those are two more hops; without them the router would
+# lazy-load per assignment on a closed async session and raise. Kept separate
+# from _USER_LOADS so the login path is not made to pay for the admin screen's
+# joins on every single request.
+_USER_DETAIL_LOADS = (
+    selectinload(User.instructor_assignments).selectinload(
+        InstructorAssignment.course
+    ),
+    selectinload(User.instructor_assignments).selectinload(
+        InstructorAssignment.subject
+    ),
+)
+
+
+async def list_users(db: AsyncSession) -> List[User]:
+    """Every login with its assignments resolved. TRAINING_CONTROL's staff view.
+
+    Unpaginated, like list_courses and unlike list_students: this is the staff
+    table, which is the four roles' worth of accounts, not a roster that grows
+    with every intake. Add paging here the day that stops being true.
+
+    Ordered by role then username so the table groups itself, rather than by id
+    which would interleave the roles in creation order.
+    """
+    r = await db.execute(
+        select(User)
+        .options(*_USER_DETAIL_LOADS)
+        .order_by(User.role, User.username)
+    )
+    return list(r.scalars().all())
+
+
+async def get_user_detail(db: AsyncSession, user_id: int) -> Optional[User]:
+    """One login, loaded deeply enough to serialise its assignments by name."""
+    r = await db.execute(
+        select(User).options(*_USER_DETAIL_LOADS).where(User.id == user_id)
+    )
+    return r.scalar_one_or_none()
+
+
+async def create_instructor(
+    db: AsyncSession, data: InstructorCreate, must_change_password: bool = True
+) -> User:
+    """Create one INSTRUCTOR login from a plaintext password.
+
+    The role is hard-coded here as well as in the route. That is deliberate
+    duplication: this function is the one that writes the row, and a caller
+    that later passes it a different schema should not be able to talk it into
+    writing a HOD. linked_student_id is left NULL, which is what
+    ck_users_student_link requires of every non-STUDENT row.
+
+    must_change_password defaults to TRUE and that is the whole point: the
+    password was chosen by the TRAINING_CONTROL user, not by the instructor who
+    will use it, which is exactly the condition models.py describes the flag as
+    marking. The instructor meets auth.py's forced-change screen on first login
+    and picks their own. scripts/05_add_user.py does NOT set it - it predates
+    the flag - so an account made by the script and one made by the portal
+    differ in this one field, by design.
+
+    hash_password is imported inside the function: backend.utils.security pulls
+    in passlib, and crud is imported by every router including the ones that
+    never touch a password.
+    """
+    from backend.utils.security import hash_password
+
+    user = User(
+        role=UserRole.INSTRUCTOR,
+        username=data.username,
+        password_hash=hash_password(data.password),
+        full_name=data.full_name,
+        linked_student_id=None,
+        is_active=True,
+        must_change_password=must_change_password,
+    )
+    db.add(user)
+    await db.flush()
+    # Re-read through get_user_detail so instructor_assignments is loaded - an
+    # empty list on a brand-new account, but the caller serialises it either
+    # way, and a lazy-load on a fresh row would raise on the async session.
+    await db.refresh(user)
+    return await get_user_detail(db, user.id)
+
+
+async def create_assignment(
+    db: AsyncSession, user_id: int, course_id: int, subject_id: int
+) -> bool:
+    """Grant one course+subject pair. True if added, False if already held.
+
+    Idempotent by the same route as scripts/05_add_user.py:assign - the
+    uq_instr_assign unique constraint decides, not a pre-check - so re-adding a
+    pair someone already holds is a no-op rather than an error. That is what
+    lets the portal's assign form be re-submitted safely.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    stmt = (
+        pg_insert(InstructorAssignment)
+        .values(user_id=user_id, course_id=course_id, subject_id=subject_id)
+        .on_conflict_do_nothing(constraint="uq_instr_assign")
+        .returning(InstructorAssignment.id)
+    )
+    inserted = (await db.execute(stmt)).scalar()
+    await db.flush()
+    return inserted is not None

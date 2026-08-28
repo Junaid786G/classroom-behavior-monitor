@@ -199,11 +199,13 @@ def test_eyes_closed_cnn_maps_landmarks_to_original_frame(monkeypatch, frame_and
 
     result = analyzer._eyes_closed_cnn(frame, bbox, lms)
 
-    # Expected mapping, recomputed from the same padded-box helper the code uses.
-    x1c, y1c, x2c, y2c = bmod._padded_face_box(frame, bbox)
-    rw, rh = x2c - x1c, y2c - y1c
-    exp_left = [(x1c + lms[i].x * rw, y1c + lms[i].y * rh) for i in bmod._LEFT_EYE]
-    exp_right = [(x1c + lms[i].x * rw, y1c + lms[i].y * rh) for i in bmod._RIGHT_EYE]
+    # Expected mapping, recomputed from the same SQUARE-box helper the code uses.
+    # Was _padded_face_box with separate rw/rh scales; _crop_face now produces an
+    # aspect-preserving square crop, so the inverse mapping is one scale for both
+    # axes. See _square_face_box for why the crop changed.
+    sx1, sy1, side = bmod._square_face_box(frame, bbox)
+    exp_left = [(sx1 + lms[i].x * side, sy1 + lms[i].y * side) for i in bmod._LEFT_EYE]
+    exp_right = [(sx1 + lms[i].x * side, sy1 + lms[i].y * side) for i in bmod._RIGHT_EYE]
 
     assert result is True
     assert captured["frame"] is frame                     # original frame, not a 256×256 crop
@@ -216,7 +218,7 @@ def test_eyes_closed_cnn_falls_back_when_bbox_too_small(monkeypatch):
     """A degenerate bbox yields no padded box; the CNN gate falls back to True so
     a mapping failure never suppresses an otherwise-valid SLEEPING call."""
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    bbox = np.array([100, 100, 103, 103], dtype=float)   # < 5px -> _padded_face_box None
+    bbox = np.array([100, 100, 103, 103], dtype=float)   # < 5px -> _square_face_box None
 
     called = {"n": 0}
 

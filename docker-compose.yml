@@ -5,24 +5,37 @@
 #   postgres       PostgreSQL 16 + pgvector extension
 #   redis          Redis 7  (Celery broker + result backend)
 #   backend        FastAPI + Uvicorn  (port 8000)
-#   celery_worker  Celery worker for async video processing
-#   flower         Celery task monitor  (port 5555)  [opt-in profile]
+#   celery_worker  Celery worker for async video processing  [profile: workers]
+#                  ⚠ requires backend/tasks.py, which does not exist yet
+#   flower         Celery task monitor  (port 5555)  [profile: monitoring]
 #   frontend       Streamlit dashboard  (port 8501)
 #
 # GPU support
 # ───────────
-#   1. Install nvidia-container-toolkit on the host.
-#   2. Uncomment the `deploy:` blocks under backend / celery_worker.
-#   3. Swap onnxruntime → onnxruntime-gpu and faiss-cpu → faiss-gpu
-#      in requirements.txt, then rebuild:
-#        docker compose build backend celery_worker
+#   Use the overlay file — do NOT edit this one. It selects Dockerfile.backend.gpu
+#   (CUDA 12.2 + cuDNN 8 + onnxruntime-gpu) and reserves the device:
+#
+#     docker compose -f docker-compose.yml -f docker-compose.gpu.yml build backend
+#     docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+#   Requires nvidia-container-toolkit on the host and Compose v2 — the legacy
+#   docker-compose 1.29 parses these files but SILENTLY IGNORES the GPU
+#   reservation, leaving you on CPU. See DEPLOYMENT.md §2.
+#
+# Models
+# ──────
+#   Run `python3 scripts/00_fetch_models.py` once before the first build.
+#   ./models is bind-mounted read-only at /app/models (MODELS_PATH).
 #
 # Quick start (CPU)
 # ─────────────────
+#   python3 scripts/00_fetch_models.py
 #   docker compose up -d postgres redis
 #   docker compose run --rm backend python scripts/01_setup_db.py
 #   docker compose run --rm backend python scripts/02_register_students.py
 #   docker compose up -d
+#
+# Full instructions: DEPLOYMENT.md
 #
 # Monitoring profile (optional Flower UI)
 #   docker compose --profile monitoring up -d
@@ -98,12 +111,14 @@ services:
       ALGORITHM:               ${ALGORITHM:-HS256}
       STORAGE_PATH:            /app/data
       LOGS_PATH:               /app/logs
+      MODELS_PATH:             /app/models
       INSIGHTFACE_MODEL_NAME:  ${INSIGHTFACE_MODEL_NAME:-buffalo_l}
       GALLERY_REBUILD_ON_STARTUP: ${GALLERY_REBUILD_ON_STARTUP:-false}
       CORS_ORIGINS:            '["http://localhost:8501","http://frontend:8501"]'
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./models:/app/models:ro
       - insightface_cache:/root/.insightface
     ports:
       - "${BACKEND_PORT:-8000}:8000"
@@ -120,18 +135,19 @@ services:
       start_period: 90s        # InsightFace model loading can be slow on first start
     networks:
       - cctv_net
-    # ── GPU support (uncomment for NVIDIA) ───────────────────────────────
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+    # GPU: see docker-compose.gpu.yml
 
   # ── Celery worker – async video processing ───────────────────────────────
+  #
+  #  ⚠ NOT STARTED BY DEFAULT. This service runs `celery -A backend.tasks`, but
+  #    backend/tasks.py does not exist — Celery is not wired into the codebase at
+  #    all (nothing imports it). Left in the file as the intended shape for when
+  #    async processing lands; until then it crash-loops, so it sits behind the
+  #    `workers` profile:  docker compose --profile workers up -d
   celery_worker:
     image: cm_backend:latest
+    profiles:
+      - workers
     container_name: cm_celery
     restart: unless-stopped
     command: >
@@ -148,10 +164,12 @@ services:
       SECRET_KEY:             ${SECRET_KEY:-change_me_in_production_32chars}
       STORAGE_PATH:           /app/data
       LOGS_PATH:              /app/logs
+      MODELS_PATH:            /app/models
       INSIGHTFACE_MODEL_NAME: ${INSIGHTFACE_MODEL_NAME:-buffalo_l}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./models:/app/models:ro
       - insightface_cache:/root/.insightface
     depends_on:
       postgres:
@@ -160,13 +178,7 @@ services:
         condition: service_healthy
     networks:
       - cctv_net
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+    # GPU: see docker-compose.gpu.yml
 
   # ── Celery Flower – task monitoring UI (opt-in) ───────────────────────────
   flower:
@@ -189,6 +201,7 @@ services:
       - cctv_net
     profiles:
       - monitoring          # start with: docker compose --profile monitoring up -d
+      # Also needs the `workers` profile, and backend/tasks.py to exist.
 
   # ── Streamlit frontend ────────────────────────────────────────────────────
   frontend:

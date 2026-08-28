@@ -8,10 +8,28 @@ course+subject pairs.
            --full-name "Dr. Ahmed" --assign 99B:AV-423 --assign 99B:AV-482
     python scripts/05_add_user.py --username ahmed --assign 99B:IE-413   # top up
 
-Interim tool. Creating instructor accounts and assigning them to course+
-subject pairs is a TRAINING_CONTROL job that moves into the Phase 2 Admin UI;
-this stays useful afterwards for scripted / bulk setup and for bootstrapping
-the first account, which no UI can do for itself.
+Creating instructor accounts and assigning them to course+subject pairs now
+also lives in the Training Control portal (frontend/pages/8_training_control.py,
+POST /users). This script stays for three things the portal cannot do:
+
+  * BOOTSTRAP. The portal is gated to TRAINING_CONTROL, so it cannot create the
+    first TRAINING_CONTROL account - the role that owns the UI has to exist
+    before anyone can open it:
+
+        USER_SEED_PASSWORD=... python scripts/05_add_user.py \
+            --username training --role training_control \
+            --full-name "Training Control"
+
+  * OTHER ROLES. POST /users creates INSTRUCTOR and nothing else. HOD and
+    TRAINING_CONTROL logins come from here; student logins from
+    06_seed_student_logins.py.
+
+  * SCRIPTED / BULK setup, and --dry-run, which a form has no equivalent of.
+
+One behavioural difference worth knowing: accounts created through the portal
+are flagged must_change_password, because the password was chosen by whoever
+filled in the form. This script does not set that flag - it predates it - so an
+account seeded here logs in directly with the password it was given.
 
 THE PASSWORD NEVER COMES FROM THE COMMAND LINE
 ──────────────────────────────────────────────
@@ -44,7 +62,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.config import get_settings
 from backend.database import check_connection
-from backend.models import UserRole
+# RESERVED_SUBJECT_CODES has one definition, shared with scripts/04 and the
+# TRAINING_CONTROL write routes in backend/routers/. It used to be a local copy
+# in each of the three.
+from backend.models import RESERVED_SUBJECT_CODES, UserRole
 # The one supported way to turn a password into a users.password_hash value:
 # see the module docstring in backend/utils/security.py. 03_migrate_multicourse
 # predates it and calls pwd_context.hash directly; new code should not.
@@ -61,10 +82,6 @@ def warn(m): print(f"  {_Y}!{_RS} {m}")
 def info(m): print(f"  {_C}▸{_RS} {m}")
 
 DEFAULT_PASSWORD_ENV = "USER_SEED_PASSWORD"
-
-# Reserved by 03_migrate_multicourse for the pre-migration history bucket. It is
-# is_active=FALSE and must never be assigned to anyone. Same list as 04.
-RESERVED_SUBJECT_CODES = {"LEGACY-CS"}
 
 # The API speaks these; the DB stores the enum *name* (uppercase). Sourced from
 # UserRole so a role added later shows up here without editing this script.

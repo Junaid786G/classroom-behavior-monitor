@@ -19,20 +19,37 @@ from backend.pipeline.eye_classifier import get_eye_classifier
 
 logger = logging.getLogger(__name__)
 
-_MODEL_PATH      = "/home/muhammadjunaidmalik/classroom_monitor/models/face_landmarker.task"
+_MODEL_PATH      = str(get_settings().face_landmarker_path)
 _LEFT_EYE        = [362, 385, 387, 263, 373, 380]
 _RIGHT_EYE       = [33,  160, 158, 133, 153, 144]
 _YAW_THRESHOLD        = get_settings().behavior_yaw_threshold
 _DISTRACTED_SECONDS = 5.0
 _SLEEPING_SECONDS     = get_settings().behavior_sleeping_seconds
 _SLEEP_RATIO          = get_settings().behavior_sleep_ratio
-_EAR_FALLBACK       = 0.20
+# EAR-space constants below were re-derived on 2026-08-28 when _crop_face
+# stopped squashing the face crop. Aspect distortion scaled every EAR by the
+# crop's width/height; removing it raised measured EAR by x1.227 (512 paired
+# samples across test_clip_8min.mp4). These three are ABSOLUTE thresholds in EAR
+# units, so they had to move with it -- leaving _EAR_STD_UNSTABLE at 0.080 would
+# have flagged far more tracks "unstable", which imposes the STRICTER 0.35 ratio
+# and the LONGER 3.0s dwell, i.e. would have made sleep HARDER to detect.
+# Ratio-based constants (_SLEEP_RATIO et al) are scale-free and did not move.
+_EAR_FALLBACK       = 0.245    # was 0.20
+# NOTE: despite the name, _EAR_HISTORY_LEN now governs only the POSE baseline
+# (_pose_baseline). The EAR baseline is time-windowed instead -- see
+# _EAR_BASELINE_WINDOW_MS. The name is kept because the pose tests pin it.
 _EAR_HISTORY_LEN    = 15
 _EAR_HISTORY_MIN    = 5
+# The EAR baseline window is TIME, not frame count. A 15-frame window spans 15s
+# on the recorded path (1fps) but ~1.5s on a fast live feed, so the baseline
+# collapsed onto the closure before the 1.5s dwell matured and SLEEPING became
+# structurally unreachable at high sampling rates.
+_EAR_BASELINE_WINDOW_MS   = 60_000.0
+_EAR_BASELINE_MAX_SAMPLES = 900     # hard cap so a fast feed cannot grow this without bound
 _SLEEP_RATIO_UNSTABLE = 0.35   # stricter sleep ratio for high-EAR-variance (glasses/occluded) tracks
 _SLEEPING_SECONDS_UNSTABLE = 3.0   # longer sustain required before SLEEPING on unstable tracks
-_EAR_STD_UNSTABLE     = 0.08   # per-track EAR std-dev above this ⇒ landmarks unreliable
-_EYE_ASYM_MAX         = 0.15   # |EAR_left − EAR_right| above this ⇒ eye landmarks unreliable this frame
+_EAR_STD_UNSTABLE     = 0.098  # was 0.080; per-track EAR std-dev above this ⇒ landmarks unreliable
+_EYE_ASYM_MAX         = 0.184  # was 0.150; |EAR_left − EAR_right| above this ⇒ eye landmarks unreliable this frame
 _POSE_PITCH_HEAD_DOWN = get_settings().behavior_pitch_head_down   # pitch-only head-down bar when EAR is untrustworthy
 _YAW_DEVIATION        = get_settings().behavior_yaw_deviation     # |yaw − own median| above this ⇒ looking away
 _PITCH_DEVIATION      = get_settings().behavior_pitch_deviation   # pitch above own median by this ⇒ head down
@@ -92,16 +109,56 @@ def _padded_face_box(frame: np.ndarray, bbox: np.ndarray,
     return x1c, y1c, x2c, y2c
 
 
+def _square_face_box(frame: np.ndarray, bbox: np.ndarray,
+                     pad: float = 0.60) -> Optional[Tuple[int, int, int]]:
+    """(x1, y1, side) of a SQUARE box around the padded face, in original-frame
+    pixels. Deliberately NOT clamped to the frame — the caller zero-fills
+    whatever overhangs, which is what keeps the box square when a face sits near
+    an edge or fills the view.
+
+    Squareness is the entire point. _crop_face resizes this to 256×256, and a
+    RECTANGULAR box gets squashed by its own aspect ratio: ~0.86 on the
+    classroom footage this was tuned against, but up to 1.78 once a close-up
+    face makes the padded box clamp to a 16:9 frame. On the squashed crop
+    MediaPipe returned NO landmarks for a CLOSED eye 83-92% of the time (0% for
+    open eyes at identical framing, 0% with aspect preserved), so _analyze_one
+    took the no-landmark path and _carry_or_unknown replayed ATTENTIVE while a
+    student sat with their eyes shut. A square box makes the crop scale uniform
+    at every face size, which is also what lets one set of EAR constants hold
+    across the whole range instead of only at the distance they were fitted to.
+
+    Evidence and the regression that pins it: backend/tests/test_behavior_eye_geometry.py
+    """
+    x1, y1, x2, y2 = (int(v) for v in bbox[:4])
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 5 or bh < 5:
+        return None
+    px, py = int(bw * pad), int(bh * pad)
+    x1p, y1p, x2p, y2p = x1 - px, y1 - py, x2 + px, y2 + py
+    side = max(x2p - x1p, y2p - y1p)
+    cx, cy = (x1p + x2p) / 2.0, (y1p + y2p) / 2.0
+    return int(round(cx - side / 2.0)), int(round(cy - side / 2.0)), int(side)
+
+
 def _crop_face(frame: np.ndarray, bbox: np.ndarray, pad: float = 0.60) -> Optional[np.ndarray]:
-    """Crop padded face region from full frame, resize to 256×256, return BGR."""
-    box = _padded_face_box(frame, bbox, pad)
+    """Square, aspect-preserving 256×256 BGR crop of the padded face region.
+
+    Area overhanging the frame is zero-filled rather than clipped, so the crop
+    stays square and the landmark→pixel mapping stays a single scale+offset
+    (see _square_face_box and _eyes_closed_cnn).
+    """
+    box = _square_face_box(frame, bbox, pad)
     if box is None:
         return None
-    x1c, y1c, x2c, y2c = box
-    crop = frame[y1c:y2c, x1c:x2c]
-    if crop.size == 0:
+    sx1, sy1, side = box
+    h, w = frame.shape[:2]
+    x1, y1 = max(0, sx1), max(0, sy1)
+    x2, y2 = min(w, sx1 + side), min(h, sy1 + side)
+    if x2 <= x1 or y2 <= y1:
         return None
-    return cv2.resize(crop, (256, 256))
+    canvas = np.zeros((side, side, 3), dtype=frame.dtype)
+    canvas[y1 - sy1:y2 - sy1, x1 - sx1:x2 - sx1] = frame[y1:y2, x1:x2]
+    return cv2.resize(canvas, (256, 256))
 
 
 class BehaviorAnalyzer:
@@ -116,6 +173,25 @@ class BehaviorAnalyzer:
         self._pitch_history: Dict[int, list] = {}
         self._last_behavior: Dict[int, BehaviorType] = {}   # last confident behavior per track
         self._carry_count:   Dict[int, int] = {}            # consecutive carried-forward frames
+
+    def reset_all(self) -> None:
+        """Clear per-track state for EVERY track — call between sessions.
+
+        Distinct from reset(track_id) below, which drops one track when it dies.
+
+        Every dict here is keyed by track_id and was previously never cleared, so
+        state leaked across sessions (a recycled track_id inherited the previous
+        occupant's dwell timers and EAR baseline) and grew without bound on a
+        long-running live feed. The loaded FaceLandmarker is deliberately kept:
+        it is stateless and costly to rebuild.
+        """
+        self._distracted_since.clear()
+        self._sleeping_since.clear()
+        self._ear_history.clear()
+        self._yaw_history.clear()
+        self._pitch_history.clear()
+        self._last_behavior.clear()
+        self._carry_count.clear()
 
     def _record(self, track_id: int, behavior: BehaviorType) -> None:
         """Remember a confident classification and reset the carry-forward counter."""
@@ -251,20 +327,49 @@ class BehaviorAnalyzer:
             # unreliable this frame (e.g. a glasses frame sitting over the eye) — do not
             # trust EAR for this frame.
             eye_reliable = abs(ear_left - ear_right) <= _EYE_ASYM_MAX
+            # The baseline estimates this track's OPEN-eye EAR. Two rules stop a
+            # closure being absorbed into the very baseline it is judged against:
+            #
+            #   1. the window is TIME-based (_EAR_BASELINE_WINDOW_MS), not frame
+            #      count, so it means the same thing at 1fps and at 30fps;
+            #   2. samples are NOT admitted while a closure is already in
+            #      progress. Without this, ANY finite window eventually adapts:
+            #      the 75th percentile slid onto the closed value after ~10
+            #      consecutive closed samples and a genuinely sleeping student
+            #      silently reverted to ATTENTIVE about 9s in.
+            #
+            # This deliberately departs from the rule _pose_baseline states for
+            # pose ("frames are never excluded on the basis of how they were
+            # classified"). The two are estimating different things: the pose
+            # baseline wants the track's RESTING pose, which every frame informs,
+            # while this wants the track's OPEN-eye reference, which closed
+            # frames actively misinform. _pose_baseline is unchanged.
+            #
+            # The freeze reads the PREVIOUS frame's verdict (_sleeping_since is
+            # set later in this method), so exactly one closed sample enters the
+            # window at the onset of each closure. That is deliberate: one sample
+            # cannot move a 75th percentile, and reading this frame's own verdict
+            # would make the baseline depend on a decision derived from it.
             history = self._ear_history.setdefault(track_id, [])
-            history.append(ear)
-            if len(history) > _EAR_HISTORY_LEN:
-                del history[:-_EAR_HISTORY_LEN]
-            if len(history) < _EAR_HISTORY_MIN:
+            if self._sleeping_since.get(track_id) is None:
+                history.append((timestamp_ms, ear))
+                cutoff = timestamp_ms - _EAR_BASELINE_WINDOW_MS
+                while history and history[0][0] < cutoff:
+                    history.pop(0)
+                if len(history) > _EAR_BASELINE_MAX_SAMPLES:
+                    del history[:-_EAR_BASELINE_MAX_SAMPLES]
+            ear_window = [e for _, e in history]
+            if len(ear_window) < _EAR_HISTORY_MIN:
                 baseline_ear = _EAR_FALLBACK
             else:
-                baseline_ear = float(np.percentile(history, 75))
+                baseline_ear = float(np.percentile(ear_window, 75))
             # EAR-variance detection: a high per-track std-dev indicates unstable landmark
             # detection (glasses/occlusion). For such tracks require EAR to drop further
             # before calling SLEEPING, to cut false positives.
             sleep_ratio = _SLEEP_RATIO
             sleeping_secs = _SLEEPING_SECONDS
-            unstable = len(history) >= _EAR_HISTORY_MIN and float(np.std(history)) > _EAR_STD_UNSTABLE
+            unstable = (len(ear_window) >= _EAR_HISTORY_MIN
+                        and float(np.std(ear_window)) > _EAR_STD_UNSTABLE)
             if unstable:
                 sleep_ratio   = _SLEEP_RATIO_UNSTABLE
                 sleeping_secs = _SLEEPING_SECONDS_UNSTABLE
@@ -352,15 +457,20 @@ class BehaviorAnalyzer:
         so a model failure never suppresses an otherwise-valid SLEEPING call.
         """
         try:
-            box = _padded_face_box(frame, bbox)
+            box = _square_face_box(frame, bbox)
             if box is None:
                 return True
-            x1c, y1c, x2c, y2c = box
-            rw, rh = x2c - x1c, y2c - y1c
-            # normalized 256×256-crop coords → original-frame pixels
+            sx1, sy1, side = box
+            # normalized 256×256-crop coords → original-frame pixels. ONE scale
+            # for both axes, because the crop is square: the old two-scale form
+            # (rw, rh from the clamped rectangle) is wrong for an aspect-
+            # preserving crop and would land the eye boxes off-target. Points may
+            # fall outside the frame where the square overhangs; _crop_eye clamps
+            # to frame bounds and returns None on a degenerate box, which the
+            # caller reads as "not closed" rather than a bad crop.
             def to_orig(i):
                 lm = lms[i]
-                return (x1c + lm.x * rw, y1c + lm.y * rh)
+                return (sx1 + lm.x * side, sy1 + lm.y * side)
             left  = [to_orig(i) for i in _LEFT_EYE]
             right = [to_orig(i) for i in _RIGHT_EYE]
             return self._eye_clf.both_eyes_closed(frame, left, right)

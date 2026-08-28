@@ -22,6 +22,7 @@ from permissions import (
     PAGE_HOME,
     PAGE_LIVE_MONITOR,
     PAGE_STUDENT_DASHBOARD,
+    PAGE_TRAINING_CONTROL,
     can_access,
     require_page_access,
 )
@@ -175,6 +176,8 @@ with right:
          "Behavioural analytics charts and attention timelines."),
         (PAGE_ADMIN, "⚙️ Admin Panel", "#ff8c2b",
          "Register students, upload enrollment videos, rebuild gallery."),
+        (PAGE_TRAINING_CONTROL, "🛠 Training Control", "#c586f0",
+         "Add subjects, create instructor accounts, assign them to courses."),
     ]
 
     visible = [c for c in _QUICK_ACTIONS if can_access(role, c[0])]

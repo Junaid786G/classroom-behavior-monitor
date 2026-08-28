@@ -1,6 +1,23 @@
 """Why EYE_STATE_METHOD defaults to "ear", and the limitation that remains.
 
 =============================================================================
+THE ABSOLUTE EAR NUMBERS BELOW ARE HISTORICAL (noted 2026-08-28)
+=============================================================================
+Every EAR figure in this module -- ali's 0.0976 median, saad's 0.023-0.056,
+the 0.107/0.121 open readings -- was measured when _crop_face resized a
+RECTANGULAR box to 256x256 and so scaled EAR by the crop's aspect ratio. That
+was fixed on 2026-08-28 (see _square_face_box); on this footage the same eyes
+now measure x1.227 higher (512 paired samples). Re-measuring would change every
+number here and none of the conclusions: the cnn-vs-ear comparison and the
+aliasing analysis both rest on RATIOS against each student's own baseline, and
+a uniform scale factor cancels in a ratio. The figures are left as recorded
+rather than silently rescaled, so the evidence stays the evidence that was
+actually taken. Do not compare them directly against EAR values measured today.
+
+The sustained closure at f6775-6975 documented below is now also the source of
+the classroom fixtures in backend/tests/test_behavior_eye_geometry.py.
+
+=============================================================================
 THE DECISION (2026-08-19)
 =============================================================================
 Both eye gates were replayed over identical frames of test_clip_8min.mp4

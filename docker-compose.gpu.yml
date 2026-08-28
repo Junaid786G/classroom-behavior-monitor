@@ -1,0 +1,46 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  NVIDIA GPU overlay
+#
+#  Use alongside the base file — it never replaces it:
+#
+#    docker compose -f docker-compose.yml -f docker-compose.gpu.yml build backend
+#    docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+#  Requires nvidia-container-toolkit on the host and Compose v2 (the
+#  deploy.resources.reservations.devices syntax is ignored by Compose v1).
+#
+#  Only backend and celery_worker are GPU-aware; postgres, redis and the
+#  Streamlit frontend stay unchanged.
+# ════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend.gpu
+    image: cm_backend:gpu
+    environment:
+      INSIGHTFACE_CTX_ID: "0"        # 0+ = GPU device id, -1 = CPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  celery_worker:
+    image: cm_backend:gpu
+    environment:
+      INSIGHTFACE_CTX_ID: "0"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  flower:
+    image: cm_backend:gpu        # shares the backend image; no GPU reservation

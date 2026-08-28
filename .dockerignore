@@ -1,0 +1,57 @@
+# ════════════════════════════════════════════════════════════════════
+#  Docker build context exclusions
+#
+#  NOTE: unlike .gitignore, .dockerignore patterns do NOT recurse.
+#  A bare "__pycache__/" matches ONLY the context root, so every
+#  pattern that must match at any depth is written as "**/<pattern>".
+# ════════════════════════════════════════════════════════════════════
+
+# ─── Virtualenvs ────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ─── Python bytecode & tool caches ──────────────────────────────────
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# ─── Runtime data (bind-mounted via ./data:/app/data at run time) ───
+data/
+
+# ─── Model weights (fetched by scripts/00_fetch_models.py, ──────────
+#     bind-mounted via ./models:/app/models) ────────────────────────
+models/
+
+# ─── Logs ───────────────────────────────────────────────────────────
+logs/
+**/*.log
+
+# ─── Secrets — .env.example MUST stay (Dockerfile.backend COPYs it) ─
+.env
+.env.local
+**/.env
+
+# ─── VCS & tooling ──────────────────────────────────────────────────
+.git/
+.gitignore
+.github/
+.claude/
+.vscode/
+.idea/
+
+# ─── Backups & editor cruft ─────────────────────────────────────────
+**/*.backup_*
+backups/
+**/*.swp
+**/.DS_Store
+
+# ─── Build/docs files not needed inside the image ───────────────────
+Dockerfile.*
+docker-compose.yml
+docker-compose.*.yml
+DEPLOYMENT.md
+README.md

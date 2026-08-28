@@ -1,0 +1,18 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  GPU overlay — installed by Dockerfile.backend.gpu AFTER requirements.txt
+#  (with the CPU `onnxruntime==` line filtered out).
+#
+#  onnxruntime-gpu 1.18.1 built against CUDA 12 is NOT on public PyPI; only the
+#  CUDA 11.8 build is. The CUDA 12 wheels live on the ONNX Runtime team's Azure
+#  DevOps feed below. The version is held identical to the CPU pin so GPU and
+#  CPU deployments produce the same numerics.
+#
+#  faiss stays on faiss-cpu deliberately: faiss-gpu 1.8.0 was never published to
+#  PyPI (conda-only), and the gallery is a flat inner-product index over a few
+#  hundred embeddings — it is not the bottleneck.
+# ════════════════════════════════════════════════════════════════════════════
+
+--extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+
+onnxruntime-gpu==1.18.1
+nvidia-ml-py==12.560.30

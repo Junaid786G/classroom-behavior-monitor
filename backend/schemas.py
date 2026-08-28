@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from backend.models import (
     AlertSeverity,
@@ -53,6 +53,49 @@ class SubjectOut(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class SubjectCreate(BaseModel):
+    """Add one subject to a course — the API form of scripts/04_add_subject.py.
+
+    course_id is NOT here: it comes from the path (/courses/{id}/subjects), so
+    the body cannot name a different course than the URL was authorised for.
+
+    subject_code is normalised to upper case and subject_name is stripped, the
+    same two transforms 04_add_subject.py applies to its arguments, so a subject
+    created through the portal and one created through the script are identical
+    rows.
+    """
+    subject_code: str = Field(..., min_length=1, max_length=40)
+    subject_name: str = Field(..., min_length=1, max_length=200)
+
+    @field_validator("subject_code")
+    @classmethod
+    def _upper(cls, v: str) -> str:
+        return v.strip().upper()
+
+    @field_validator("subject_name")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        return v.strip()
+
+
+class SubjectUpdate(BaseModel):
+    """Rename or archive one subject.
+
+    The editing half has no CLI equivalent — 04_add_subject.py can only add, and
+    is a no-op on an existing pair. subject_code is deliberately absent: it is
+    half of uq_subjects_course_code and is referenced by every session's history,
+    so renaming the *code* is a migration, not an edit. The display name and the
+    archived flag are the two things that are safe to change in place.
+    """
+    subject_name: Optional[str] = Field(None, min_length=1, max_length=200)
+    is_active: Optional[bool] = None
+
+    @field_validator("subject_name")
+    @classmethod
+    def _strip(cls, v: Optional[str]) -> Optional[str]:
+        return v.strip() if v is not None else v
 
 
 # ── Classroom ─────────────────────────────────────────────────────────────────
@@ -123,6 +166,12 @@ class StudentOut(StudentBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    # The student's course. Already NOT NULL on the model (models.py:261); it
+    # was simply never serialised. The dashboard needs it to tell whether a
+    # running session belongs to this student's course. classroom_id cannot
+    # answer that - it is nullable, which is the same trap that made
+    # reconcile_absent_students write no rows at all.
+    course_id: int
     photo_path: Optional[str] = None
     embedding_path: Optional[str] = None
     gallery_index: Optional[int] = None
@@ -489,6 +538,50 @@ class WSFrameResult(BaseModel):
     frame_b64: Optional[str] = None   # annotated JPEG as base64
 
 
+# ── Live (RTSP) ingestion ─────────────────────────────────────────────────────
+
+class LiveStartRequest(BaseModel):
+    """Start server-side capture from a network camera.
+
+    The backend opens this URL itself with cv2.VideoCapture; the browser never
+    touches the stream, so an RTSP URL reachable only from the server is fine.
+    """
+    rtsp_url: str = Field(
+        ...,
+        min_length=1,
+        max_length=512,
+        description="rtsp:// (or rtsps/http/udp/tcp) URL, or a camera device index",
+        examples=["rtsp://user:pass@192.168.1.50:554/Streaming/Channels/101"],
+    )
+
+
+class LiveDetection(BaseModel):
+    track_id: int
+    student_id: Optional[int] = None
+    student_name: Optional[str] = None
+    bbox: List[float]                       # normalised x1,y1,x2,y2
+    det_confidence: Optional[float] = None
+    rec_confidence: Optional[float] = None
+    behavior: Optional[str] = None
+
+
+class LiveStatusOut(BaseModel):
+    session_id: str
+    rtsp_url: str
+    state: str                              # starting|running|reconnecting|stopping|stopped|error
+    frames_processed: int = 0
+    frames_persisted: int = 0
+    reconnects: int = 0
+    connected: bool = False
+    last_error: Optional[str] = None
+    started_at: Optional[str] = None
+    last_frame_at: Optional[str] = None
+    processed_fps: float = 0.0
+    frame_seq: int = 0                      # bumps once per published frame
+    detections: List[LiveDetection] = []
+    frame_b64: Optional[str] = None         # latest annotated JPEG, base64
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 class HealthResponse(BaseModel):
@@ -595,6 +688,78 @@ class UserOut(BaseModel):
             ],
             last_login_at=user.last_login_at,
         )
+
+
+class InstructorCreate(BaseModel):
+    """Create one INSTRUCTOR login — the API form of scripts/05_add_user.py.
+
+    NO ROLE FIELD, AND NO linked_student_id
+    ---------------------------------------
+    The role is fixed to INSTRUCTOR by the route, not chosen by the caller.
+    That is what keeps ck_users_student_link unreachable from this endpoint: a
+    non-STUDENT row must have a NULL linked_student_id, and with no field to
+    set it there is no way to write a row the constraint would reject. Student
+    logins are seeded by scripts/06_seed_student_logins.py, which owns the
+    roster link; HOD and TRAINING_CONTROL logins are bootstrapped by
+    05_add_user.py, which is also the only thing that can create the *first*
+    TRAINING_CONTROL account.
+
+    THE PASSWORD
+    ------------
+    05_add_user.py refuses to take a password on the command line, because argv
+    is world-readable via `ps`. A form post has no argv, so the equivalent care
+    is: it is bounded like PasswordChangeRequest.new_password (hash_password
+    raises above bcrypt's 72 bytes), it is hashed by the route through
+    backend.utils.security.hash_password, and it is never logged or echoed back
+    — the response is UserDetailOut, which has no password field to leak into.
+    """
+    username: str = Field(..., min_length=1, max_length=80)
+    full_name: Optional[str] = Field(None, max_length=200)
+    password: str = Field(..., min_length=MIN_PASSWORD_LENGTH, max_length=72)
+
+    @field_validator("username")
+    @classmethod
+    def _strip_username(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("full_name")
+    @classmethod
+    def _strip_name(cls, v: Optional[str]) -> Optional[str]:
+        return v.strip() if v is not None else v
+
+
+class AssignmentCreate(BaseModel):
+    """Grant one instructor one course+subject pair.
+
+    Ids rather than codes: the portal already holds the catalogue it built its
+    dropdowns from, so it has the ids, and resolving codes server-side would be
+    re-implementing the COURSE:SUBJECT parsing that only exists in the script
+    because a CLI has nothing but strings. The route still checks that the
+    subject belongs to the named course — the composite FK would catch it, but
+    a sentence beats a constraint traceback.
+    """
+    course_id: int
+    subject_id: int
+
+
+class UserDetailOut(BaseModel):
+    """One login with its assignments spelled out — the GET /users row.
+
+    Like UserOut, this lists what may leave the server rather than excluding
+    what may not, so password_hash cannot leak by being added to the ORM model
+    later. It differs from UserOut in carrying resolved course/subject names
+    (AssignmentDetailOut, not AssignmentOut), because this feeds a table a human
+    reads, not a token claim.
+    """
+    id: int
+    username: str
+    role: UserRole
+    full_name: Optional[str] = None
+    is_active: bool = True
+    must_change_password: bool = False
+    linked_student_id: Optional[int] = None
+    last_login_at: Optional[datetime] = None
+    assignments: List[AssignmentDetailOut] = []
 
 
 class TokenResponse(BaseModel):

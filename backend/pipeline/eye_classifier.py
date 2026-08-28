@@ -13,7 +13,7 @@ from backend.utils.gpu import get_onnx_providers
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-_MODEL_PATH = "models/public/open-closed-eye-0001/open-closed-eye.onnx"
+_MODEL_PATH = str(settings.eye_state_model_path)
 _INPUT_NAME = "input.1"
 _OUTPUT_NAME = "19"
 _INPUT_SIZE = 32          # model expects 32×32

@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -85,6 +85,29 @@ def _post(path: str, **kw) -> Optional[dict]:
         return r.json() if r.ok else None
     except Exception:
         return None
+
+
+def _post_checked(path: str, **kw) -> Tuple[Optional[dict], Optional[str]]:
+    """POST returning (body, error_message).
+
+    _post() collapses every failure to None, which is fine where the only
+    question is "did it work". The live endpoints answer with a *reason* worth
+    showing — 409 "another session holds the pipeline", 422 "not a stream URL" —
+    and swallowing it leaves the operator with a dead button and no explanation.
+    """
+    try:
+        r = requests.post(f"{API_BASE}{path}", timeout=15,
+                          headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
+        if r.ok:
+            return r.json(), None
+        try:
+            detail = r.json().get("detail")
+        except Exception:
+            detail = None
+        return None, str(detail or f"HTTP {r.status_code}")
+    except Exception as exc:
+        return None, f"Could not reach the backend: {exc}"
 
 
 # user_id is unused in the bodies below and deliberately so: it puts the
@@ -240,6 +263,14 @@ def _init_state():
         "detections":     [],
         "attendance":     {},     # student_id → {name, count, last_behavior}
         "start_ts":       None,
+        # ── server-side live capture (RTSP) ──
+        # Distinct from `processing`, which drives the browser-pumped upload
+        # loop. In live mode the backend owns the capture thread and this page
+        # only polls, so the two must never both be true.
+        "live_mode":      False,
+        "live_url":       None,
+        "live_status":    None,   # last LiveStatusOut payload
+        "live_error":     None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -301,8 +332,88 @@ def _connect_and_process() -> bool:
     return True
 
 
+def _live_start(session_id: str, url: str) -> bool:
+    """Ask the backend to open the camera itself and run the pipeline on it.
+
+    Nothing about the stream touches this browser: the URL is resolved from the
+    server, so a camera on the classroom LAN works even when Streamlit is not on
+    that network.
+    """
+    body, err = _post_checked(
+        f"/sessions/{session_id}/live/start", json={"rtsp_url": url}
+    )
+    if err:
+        st.session_state.live_error = err
+        return False
+    st.session_state.live_mode = True
+    st.session_state.live_url = url
+    st.session_state.live_status = body
+    st.session_state.live_error = None
+    st.session_state.start_ts = time.time()
+    st.session_state.attendance = {}
+    st.session_state.detections = []
+    st.session_state.latest_frame_b64 = None
+    return True
+
+
+def _live_stop(session_id: str) -> None:
+    """Stop capture. The call blocks until the worker flushes its last batch.
+
+    A 404 means the worker had already finished and unregistered itself — the
+    feed can end between the last poll and this click — so it is reported as
+    "already stopped" rather than as an error the operator has to act on.
+    """
+    body, err = _post_checked(f"/sessions/{session_id}/live/stop")
+    st.session_state.live_mode = False
+    if err and "No live capture registered" in err:
+        st.session_state.live_error = None
+    elif err:
+        st.session_state.live_error = err
+    elif body:
+        st.session_state.live_status = body
+
+
+def _live_poll(session_id: str) -> Optional[dict]:
+    """Fetch the newest frame + detections from the running worker."""
+    status = _get(f"/sessions/{session_id}/live/status",
+                  params={"include_frame": "true"})
+    if status is None:
+        # A poll can fail transiently (backend restart, a slow frame). Keep the
+        # last good status on screen rather than blanking the monitor.
+        st.session_state.live_error = "Lost contact with the backend while polling."
+        return None
+
+    st.session_state.live_status = status
+    st.session_state.live_error = status.get("last_error")
+    dets = status.get("detections") or []
+    st.session_state.detections = dets
+    if status.get("frame_b64"):
+        st.session_state.latest_frame_b64 = status["frame_b64"]
+
+    for d in dets:
+        if d.get("student_id") and (d.get("rec_confidence") or 0) > 0:
+            sid = d["student_id"]
+            name = d.get("student_name") or f"Student {sid}"
+            prev = st.session_state.attendance.get(sid, {"name": name, "count": 0})
+            prev["count"] += 1
+            prev["name"] = name
+            st.session_state.attendance[sid] = prev
+
+    # The worker unregisters itself when it ends, so a terminal state is the
+    # only signal this page gets that capture is over.
+    if status.get("state") in ("stopped", "error"):
+        st.session_state.live_mode = False
+    return status
+
+
 def _clear_session() -> None:
     """Drop the active session and its frame state, back to the setup flow."""
+    # Stop the server-side worker FIRST, while session_id is still set: it runs
+    # independently of this browser and would otherwise keep capturing (and
+    # holding the single live slot) after the operator left the page.
+    if st.session_state.get("live_mode") and st.session_state.get("session_id"):
+        _live_stop(st.session_state.session_id)
+
     if st.session_state.monitor:
         st.session_state.monitor.close()
     st.session_state.monitor = None
@@ -317,6 +428,10 @@ def _clear_session() -> None:
     st.session_state.start_ts = None
     st.session_state.active_course_label = None
     st.session_state.active_subject_label = None
+    st.session_state.live_mode = False
+    st.session_state.live_url = None
+    st.session_state.live_status = None
+    st.session_state.live_error = None
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -403,22 +518,22 @@ if not st.session_state.session_id:
     live_selected = source.startswith("📡")
 
     if live_selected:
-        # Flagged, not built. classrooms.camera_url is stored and shown in the
-        # Admin panel, and pipeline/capture.py's VideoCapture wraps
-        # cv2.VideoCapture, which would open an RTSP URL - but nothing joins
-        # the two: the only VideoCapture call site processes an uploaded file,
-        # no endpoint accepts a stream URL, and the WebSocket ingests frames
-        # the client has already decoded. Wiring it is its own piece of work.
-        st.info(
-            "**Live stream capture is not built yet.**\n\n"
-            "Classrooms can store a camera URL, and the capture layer can open "
-            "an RTSP source, but nothing connects them: no endpoint accepts a "
-            "stream URL, and the processing pipeline reads uploaded files only. "
-            "Use a recorded video for now."
-        )
+        # The backend opens the camera itself (see routers/stream.py::start_live
+        # and pipeline/live_worker.py); this page never touches the stream, so
+        # the URL only has to resolve from the server.
+        active = _get("/live/active") or {}
+        if active.get("active") and active.get("session_id") != st.session_state.session_id:
+            st.warning(
+                f"A live session is already running (`{active.get('session_id')}`, "
+                f"state **{active.get('state', '?')}**, "
+                f"{active.get('frames_processed', 0):,} frames). "
+                "Only one runs at a time — the recognition pipeline keeps "
+                "per-track state in process-wide singletons. Stop that one first."
+            )
 
     classrooms = _list_classrooms(cache_user_id())
     classroom_id = None
+    chosen_room = "—"
     if not classrooms:
         st.warning("No classrooms found — is the backend running and migrated?")
     else:
@@ -430,6 +545,7 @@ if not st.session_state.session_id:
         )
         classroom_id = room_names[chosen_room]
 
+    stream_url = ""
     if not live_selected:
         _video_picker("flow_upload")
         if st.session_state.video_path:
@@ -438,13 +554,34 @@ if not st.session_state.session_id:
                 f"{st.session_state.total_frames:,} frames · "
                 f"{st.session_state.source_fps:.1f} fps"
             )
+    else:
+        # Rendered here, after the room picker, so it can default to the camera
+        # already recorded against that room in the Admin panel.
+        room = next((c for c in classrooms if c["id"] == classroom_id), {})
+        default_url = room.get("camera_url") or ""
+        stream_url = st.text_input(
+            "Stream URL",
+            value=default_url,
+            placeholder="rtsp://user:pass@192.168.1.50:554/Streaming/Channels/101",
+            help="rtsp:// · rtsps:// · http(s):// · udp:// · tcp:// · or a local "
+                 "camera index such as 0. Opened by the backend, not by this browser.",
+            key="flow_stream_url",
+        )
+        if default_url and stream_url == default_url:
+            st.caption(f"Using the camera recorded for **{chosen_room}**.")
+        elif not default_url:
+            st.caption(
+                f"No camera URL is stored for **{chosen_room}** — set one in the "
+                "Admin panel to have it prefilled here."
+            )
 
     # ── Step 5 — start ────────────────────────────────────────────────────────
     st.markdown('<p class="section-label">▸ Step 5 · Start</p>', unsafe_allow_html=True)
 
     blockers = []
     if live_selected:
-        blockers.append("live stream capture is not available")
+        if not stream_url.strip():
+            blockers.append("no stream URL")
     elif not st.session_state.video_path:
         blockers.append("no video uploaded")
     if classroom_id is None:
@@ -454,7 +591,7 @@ if not st.session_state.session_id:
         st.caption("Cannot start yet — " + "; ".join(blockers) + ".")
 
     if st.button(
-        "▶ Start Session & Processing",
+        "▶ Start Live Capture" if live_selected else "▶ Start Session & Processing",
         type="primary",
         use_container_width=True,
         disabled=bool(blockers),
@@ -480,7 +617,16 @@ if not st.session_state.session_id:
             # setup block disappears the moment a session becomes active.
             st.session_state.active_course_label = chosen_course
             st.session_state.active_subject_label = chosen_subject
-            if _connect_and_process():
+            if live_selected:
+                # start_live returns as soon as the capture thread is armed;
+                # whether the camera actually answered shows up in the polled
+                # status, so a bad URL surfaces there rather than hanging here.
+                if _live_start(resp["id"], stream_url.strip()):
+                    _list_sessions.clear()
+                    st.rerun()
+                else:
+                    st.error(st.session_state.live_error or "Could not start live capture.")
+            elif _connect_and_process():
                 _list_sessions.clear()      # the new session belongs in the list
                 st.rerun()
 
@@ -511,10 +657,20 @@ if not st.session_state.session_id:
             hide_index=True,
         )
 
+        # Only COMPLETED sessions can be re-opened: for anything else the
+        # monitor below falls through to the video upload form, which is
+        # meaningless for a session that is still running or that failed.
+        completed = [s for s in my_sessions if s.get("status") == "completed"]
         opts = {
-            f"{s.get('title') or s.get('subject', '?')} [{s['status']}]": s["id"]
-            for s in my_sessions
+            f"{s.get('title') or s.get('subject', '?')}"
+            f" · {(s.get('started_at') or '')[:16].replace('T', ' ')}": s["id"]
+            for s in completed
         }
+        st.caption(
+            f"{len(completed)} of {len(my_sessions)} session(s) can be re-opened. "
+            "Live, pending, and failed sessions are not listed — only a completed "
+            "session has results to open."
+        )
         col_pick, col_load = st.columns([3, 1])
         with col_pick:
             chosen_prev = st.selectbox(
@@ -558,7 +714,13 @@ with bar_left:
         unsafe_allow_html=True,
     )
 with bar_right:
-    if st.session_state.processing:
+    if st.session_state.live_mode:
+        if st.button("⏹ Stop Capture", use_container_width=True):
+            with st.spinner("Flushing the last batch…"):
+                _live_stop(st.session_state.session_id)
+            _list_sessions.clear()
+            st.rerun()
+    elif st.session_state.processing:
         if st.button("⏹ Stop", use_container_width=True):
             st.session_state.processing = False
             if st.session_state.monitor:
@@ -574,25 +736,66 @@ with bar_right:
 video_col, stats_col = st.columns([3, 2], gap="medium")
 
 # ── Video column ──────────────────────────────────────────────────────────────
-with video_col:
-    # A session opened from My Sessions arrives with no video attached, so the
-    # picker stays available here until processing actually starts.
-    if not st.session_state.processing:
-        if not st.session_state.video_path:
-            _video_picker("monitor_upload")
-        if st.session_state.video_path and st.button(
-            "▶ Start Processing", use_container_width=True
-        ):
-            if _connect_and_process():
-                st.rerun()
+_LIVE_STATE_COLOR = {
+    "starting":     "#ffd700",
+    "running":      "#00ff88",
+    "reconnecting": "#ff8c2b",
+    "stopping":     "#ffd700",
+    "stopped":      "#3d5a6b",
+    "error":        "#ff3344",
+}
 
-    total = max(1, st.session_state.total_frames // (_SKIP_FRAMES + 1))
-    processed = st.session_state.frame_pos // (_SKIP_FRAMES + 1)
-    progress = min(1.0, processed / total)
-    st.progress(
-        progress,
-        text=f"Frame {st.session_state.frame_pos} / {st.session_state.total_frames}",
-    )
+with video_col:
+    if st.session_state.live_mode or st.session_state.live_status:
+        # Live has no frame count to divide by — the feed is unbounded — so the
+        # progress bar is replaced with the worker's own health readout.
+        ls = st.session_state.live_status or {}
+        state = ls.get("state", "—")
+        color = _LIVE_STATE_COLOR.get(state, "#3d5a6b")
+        st.markdown(
+            f'<div style="display:flex;gap:1.4rem;align-items:center;padding:0.5rem 0.75rem;'
+            f'background:#0f1923;border:1px solid #1a3040;border-radius:4px;'
+            f'font-family:\'Share Tech Mono\',monospace;font-size:0.8rem;margin-bottom:0.6rem">'
+            f'<span style="color:{color};font-weight:700">● {state.upper()}</span>'
+            f'<span style="color:#3d5a6b">FRAMES <b style="color:#c8e6f5">'
+            f'{ls.get("frames_processed", 0):,}</b></span>'
+            f'<span style="color:#3d5a6b">SAVED <b style="color:#c8e6f5">'
+            f'{ls.get("frames_persisted", 0):,}</b></span>'
+            f'<span style="color:#3d5a6b">FPS <b style="color:#c8e6f5">'
+            f'{ls.get("processed_fps", 0.0):.1f}</b></span>'
+            f'<span style="color:#3d5a6b">RECONNECTS <b style="color:#c8e6f5">'
+            f'{ls.get("reconnects", 0)}</b></span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if st.session_state.live_url:
+            st.caption(f"Source · `{st.session_state.live_url}`")
+        if st.session_state.live_error:
+            # last_error is also set for a recoverable drop, so this is a warning
+            # while the worker is still retrying and an error once it gave up.
+            if state == "error":
+                st.error(st.session_state.live_error)
+            else:
+                st.warning(st.session_state.live_error)
+    else:
+        # A session opened from My Sessions arrives with no video attached, so the
+        # picker stays available here until processing actually starts.
+        if not st.session_state.processing:
+            if not st.session_state.video_path:
+                _video_picker("monitor_upload")
+            if st.session_state.video_path and st.button(
+                "▶ Start Processing", use_container_width=True
+            ):
+                if _connect_and_process():
+                    st.rerun()
+
+        total = max(1, st.session_state.total_frames // (_SKIP_FRAMES + 1))
+        processed = st.session_state.frame_pos // (_SKIP_FRAMES + 1)
+        progress = min(1.0, processed / total)
+        st.progress(
+            progress,
+            text=f"Frame {st.session_state.frame_pos} / {st.session_state.total_frames}",
+        )
 
     if st.session_state.latest_frame_b64:
         st.image(
@@ -605,12 +808,16 @@ with video_col:
             '<div style="height:320px;display:flex;align-items:center;justify-content:center;'
             'background:#0f1923;border:1px solid #1a3040;border-radius:4px;color:#3d5a6b;'
             'font-family:\'Share Tech Mono\',monospace;font-size:0.9rem;">'
-            "▸ No frame yet — upload a video and start processing"
-            "</div>",
+            + ("▸ Waiting for the first frame from the camera…"
+               if st.session_state.live_mode
+               else "▸ No frame yet — upload a video and start processing")
+            + "</div>",
             unsafe_allow_html=True,
         )
 
-    if st.session_state.processing:
+    if st.session_state.live_mode:
+        st.markdown('<span class="live-badge">● LIVE</span>', unsafe_allow_html=True)
+    elif st.session_state.processing:
         st.markdown('<span class="live-badge">● PROCESSING</span>', unsafe_allow_html=True)
 
 
@@ -670,6 +877,39 @@ with stats_col:
             '<p style="color:#3d5a6b;font-size:0.8rem">No confirmed attendees yet</p>',
             unsafe_allow_html=True,
         )
+
+
+# ── Live poll loop (one poll per Streamlit rerun) ─────────────────────────────
+# The upload path below pushes frames; this one only reads. The backend thread
+# keeps capturing whether or not this page is open, so a closed browser pauses
+# the display, not the session.
+if st.session_state.live_mode:
+    status = _live_poll(st.session_state.session_id)
+
+    if not st.session_state.live_mode:
+        # _live_poll cleared the flag: the worker reached a terminal state.
+        # Fall through without rerunning — a rerun here would discard the
+        # message before it is ever painted.
+        _list_sessions.clear()
+        if (status or {}).get("state") == "error":
+            st.error(
+                "Live capture stopped: "
+                + ((status or {}).get("last_error") or "the worker reported an error.")
+            )
+        else:
+            st.success(
+                "✅ Live capture finished — "
+                f"{(status or {}).get('frames_processed', 0):,} frames processed. "
+                "Check the **Attendance** page for results."
+            )
+    else:
+        # Slower than the upload loop's 0.03s: that one races through a finite
+        # file, while this one samples a feed the backend already processes at
+        # its own rate (~1 fps at the default LIVE_FRAME_SKIP). At 2s the
+        # snapshot is at most one frame stale and each poll returns a genuinely
+        # new JPEG, instead of re-fetching ~310KB of the same one twice.
+        time.sleep(2.0)
+        st.rerun()
 
 
 # ── Processing loop (runs one frame per Streamlit rerun) ─────────────────────

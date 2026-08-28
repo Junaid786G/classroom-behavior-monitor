@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     student_photos_path: Path = Path("./data/student_photos")
     embeddings_cache_path: Path = Path("./data/embeddings_cache")
     logs_path: Path = Path("./logs")
+    models_path: Path = Path("./models")
 
     # ── InsightFace / ArcFace ─────────────────────────────────────────────────
     insightface_model_name: str = "buffalo_l"
@@ -88,6 +89,30 @@ class Settings(BaseSettings):
     # Accepts a file path, RTSP URL (rtsp://…), or integer device index ("0").
     camera_source: str = "0"
 
+    # ── Live (RTSP) ingestion ─────────────────────────────────────────────────
+    # Source frames advanced per processed frame. 24 => every 25th frame, ~1 fps
+    # off a 25 fps camera, matching the cadence the Live Monitor page already
+    # used when the browser was the frame pump (_SKIP_FRAMES in 1_live_monitor.py).
+    live_frame_skip: int = Field(24, ge=0, le=200)
+    live_jpeg_quality: int = Field(70, ge=30, le=95)
+    live_max_reconnects: int = Field(20, ge=0, le=1000)
+    live_reconnect_delay: float = Field(2.0, ge=0.1, le=60.0)
+    # Processed frames buffered before a database flush. Lower than the recorded
+    # path's 100 so a live dashboard is not up to 100 frames stale.
+    live_flush_every: int = Field(20, ge=1, le=500)
+    # RTSP transport. "tcp" avoids the torn frames UDP produces on a congested
+    # LAN, but VLC's RTP output and many IP cameras do not offer TCP interleave
+    # and refuse the connection outright (~0.1s). So "tcp" falls back to udp
+    # rather than failing; "auto" lets FFmpeg negotiate; "udp" forces datagrams.
+    live_rtsp_transport: Literal["tcp", "udp", "auto"] = "tcp"
+    # SSE delivery. The stream endpoint watches the worker's frame counter and
+    # pushes only when it advances, so this is the added latency between a frame
+    # being published and reaching the client — not a request rate.
+    live_sse_watch_interval: float = Field(0.25, ge=0.05, le=5.0)
+    # Comment line sent when nothing has changed, so idle proxies and load
+    # balancers do not reap a connection that is merely waiting for a frame.
+    live_sse_heartbeat: float = Field(15.0, ge=1.0, le=120.0)
+
     # ── Celery ────────────────────────────────────────────────────────────────
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/2"
@@ -125,6 +150,16 @@ class Settings(BaseSettings):
     @property
     def embeddings_meta_path(self) -> Path:
         return self.embeddings_cache_path / "meta.json"
+
+    @property
+    def face_landmarker_path(self) -> Path:
+        """MediaPipe FaceLandmarker bundle — see scripts/00_fetch_models.py."""
+        return self.models_path / "face_landmarker.task"
+
+    @property
+    def eye_state_model_path(self) -> Path:
+        """OMZ open-closed-eye-0001 ONNX — see scripts/00_fetch_models.py."""
+        return self.models_path / "public" / "open-closed-eye-0001" / "open-closed-eye.onnx"
 
 
 @lru_cache(maxsize=1)
