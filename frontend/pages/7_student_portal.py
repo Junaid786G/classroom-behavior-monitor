@@ -26,6 +26,7 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_STUDENT_PORTAL, require_page_access
+from ui import as_display as _as_display
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -207,7 +208,7 @@ with col_b:
     if not subjects:
         st.info("No subjects on record yet.")
     else:
-        st.dataframe(
+        st.table(_as_display(
             pd.DataFrame([
                 {
                     "Subject": f"{s['subject_code']} {s['subject_name']}"
@@ -221,13 +222,8 @@ with col_b:
                 }
                 for s in subjects
             ]),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Attendance": st.column_config.NumberColumn("Attendance", format="%.0f%%"),
-                "Attention": st.column_config.NumberColumn("Attention", format="%.0f%%"),
-            },
-        )
+            percent=("Attendance", "Attention"),
+        ))
         if len(subjects) == 1:
             st.caption(
                 "One subject on record. More appear here as sessions are "
@@ -254,15 +250,8 @@ table = pd.DataFrame([
     }
     for s in data["sessions"]
 ])
-st.dataframe(
-    table,
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Attention": st.column_config.NumberColumn("Attention", format="%.0f%%"),
-        "Frames seen": st.column_config.NumberColumn("Frames seen", format="%d"),
-    },
-)
+st.table(_as_display(table, percent=("Attention",),
+                     integer=("Frames seen",)))
 
 st.markdown('<p class="section-label">▸ Session Detail</p>', unsafe_allow_html=True)
 
@@ -283,7 +272,7 @@ for s in data["sessions"]:
         counts = s.get("behavior_counts") or {}
         if counts:
             total = sum(counts.values())
-            st.dataframe(
+            st.table(_as_display(
                 pd.DataFrame([
                     {
                         "Behaviour": k.replace("_", " ").title(),
@@ -292,11 +281,8 @@ for s in data["sessions"]:
                     }
                     for k, v in sorted(counts.items(), key=lambda kv: -kv[1])
                 ]),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Share": st.column_config.NumberColumn("Share", format="%.0f%%"),
-                },
-            )
+                percent=("Share",),
+                integer=("Events",),
+            ))
         else:
             st.caption("No behaviour events recognised as you in this session.")

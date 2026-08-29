@@ -26,6 +26,7 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_COURSE_OVERVIEW, require_page_access
+from ui import as_display as _as_display
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -290,16 +291,8 @@ table = pd.DataFrame([
 for _col in ("Present", "Late", "Absent"):
     table[_col] = table[_col].astype("Int64")
 
-st.dataframe(
-    table,
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Attendance": st.column_config.NumberColumn("Attendance", format="%.0f%%"),
-        "Attention": st.column_config.NumberColumn("Attention", format="%.0f%%"),
-        "Frames": st.column_config.NumberColumn("Frames", format="%d"),
-    },
-)
+st.table(_as_display(table, percent=("Attendance", "Attention"),
+                     integer=("Frames",)))
 st.caption(
     "Attendance columns reading None mean the session has no attendance "
     "records — it was never processed, as distinct from everyone being absent."

@@ -30,6 +30,7 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_LIVE_MONITOR, require_page_access
+from ui import as_display as _as_display
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -643,7 +644,7 @@ if not st.session_state.session_id:
             "The list is scoped server-side — other instructors' sessions are "
             "not returned to this page."
         )
-        st.dataframe(
+        st.table(_as_display(
             pd.DataFrame([
                 {
                     "Status": s.get("status", "—").upper(),
@@ -653,9 +654,8 @@ if not st.session_state.session_id:
                 }
                 for s in my_sessions
             ]),
-            use_container_width=True,
-            hide_index=True,
-        )
+            integer=("Frames",),
+        ))
 
         # Only COMPLETED sessions can be re-opened: for anything else the
         # monitor below falls through to the video upload form, which is

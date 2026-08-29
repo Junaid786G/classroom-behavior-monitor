@@ -214,32 +214,32 @@ h3 { color: var(--text-hi) !important; font-family: var(--font-mono) !important;
   box-shadow: 0 0 0 2px rgba(46,61,80,0.15) !important;
 }
 
-/* ── DataFrames / Tables ───────────────────────────────────────────────────── */
+/* ── Tables ────────────────────────────────────────────────────────────────── */
+/* Every table on this site is st.table, which renders real HTML and therefore
+   obeys the palette above. st.dataframe is deliberately NOT used.
+
+   It was, on five screens, and all five rendered as empty bordered boxes for
+   any viewer whose browser was in dark mode. st.dataframe is glide-data-grid:
+   it paints into a CANVAS, and CSS cannot reach inside a canvas, so it draws
+   with Streamlit's OWN resolved theme. This stylesheet hard-codes one light
+   palette, forces it with !important, and has no @media (prefers-color-scheme)
+   rule anywhere — so on a dark-mode browser the grid drew near-white text onto
+   the near-white background forced underneath it. No error, no empty state,
+   just a box. st.table was unaffected throughout, because the rules here reach
+   it.
+
+   Pinning [theme] in .streamlit/config.toml narrows that but does not close it:
+   Streamlit's own Settings -> Appearance writes the viewer's choice to
+   localStorage (`stActiveTheme-<pathname>-v2`) and that OVERRIDES the server
+   config. Converting to st.table is what actually removes the dependency.
+
+   If st.dataframe is ever reintroduced, this is the trap it walks back into.
+   The styling below is kept minimal and deliberately does not try to colour the
+   grid's contents, which is not something CSS can do. */
 [data-testid="stDataFrame"] {
   border: 1px solid var(--border) !important;
   border-radius: 8px;
-  overflow: hidden;
   box-shadow: 0 1px 4px rgba(0,0,0,0.06);
-}
-.dvn-scroller { background: var(--bg-card) !important; }
-[data-testid="stDataFrame"] thead tr th {
-  background: var(--bg-panel) !important;
-  color: #2e3d50 !important;
-  font-family: var(--font-mono) !important;
-  font-size: 0.75rem !important;
-  font-weight: 600;
-  letter-spacing: 0.05em;
-  border-bottom: 1px solid var(--border-hi) !important;
-}
-[data-testid="stDataFrame"] tbody tr td {
-  background: var(--bg-card) !important;
-  color: var(--text-hi) !important;
-  font-family: var(--font-mono) !important;
-  font-size: 0.8rem !important;
-  border-bottom: 1px solid var(--border) !important;
-}
-[data-testid="stDataFrame"] tbody tr:hover td {
-  background: rgba(46, 61, 80, 0.04) !important;
 }
 
 /* ── Cards / panels ────────────────────────────────────────────────────────── */

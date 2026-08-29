@@ -27,6 +27,14 @@ RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir \
 # Copy frontend source
 COPY frontend/ ./frontend/
 
+# The pinned theme, and it has to come along. Streamlit reads .streamlit/
+# config.toml relative to the WORKING DIRECTORY, which is /app here, so this
+# lands where `streamlit run frontend/app.py` will look for it. Without it the
+# container falls back to resolving the theme from the viewer's browser, and a
+# dark-mode browser paints st.dataframe's canvas near-white on the near-white
+# background main.css forces — see the comment in the file itself.
+COPY .streamlit/ ./.streamlit/
+
 # Streamlit config – disable telemetry and the default light theme
 RUN mkdir -p /root/.streamlit && printf '\
 [general]\n\

@@ -1,0 +1,36 @@
+# Streamlit configuration for the Classroom CCTV Monitor frontend.
+
+[theme]
+# PINNED, and this is a bug fix rather than a preference.
+#
+# With no [theme] set, Streamlit resolves its theme from the BROWSER's
+# prefers-color-scheme (streamlit/static/static/js/index.*.js reads it). Our
+# styles/main.css does not: it hard-codes one light khaki palette and forces it
+# with !important, and contains no @media (prefers-color-scheme) rule anywhere.
+#
+# On a browser set to dark mode those two disagreed, and the disagreement was
+# invisible for every widget EXCEPT st.dataframe:
+#
+#   * st.table renders real HTML, so main.css's `color: var(--text-hi)
+#     !important` reached it and it stayed readable;
+#   * st.dataframe is glide-data-grid, which paints into a CANVAS. CSS cannot
+#     reach inside a canvas — the grid draws using Streamlit's OWN resolved
+#     theme. Resolved dark, it drew near-white text onto the near-white
+#     background main.css had forced underneath it.
+#
+# The result was a bordered box with nothing legible in it, on exactly the five
+# st.dataframe widgets and nowhere else, surviving both a process restart and a
+# hard refresh because the trigger is the viewer's colour scheme rather than
+# anything cached. streamlit.testing.v1.AppTest could not see it either: it runs
+# no browser, so it reported the rows reaching the widget, which they always did.
+#
+# These values mirror the CSS variables in frontend/styles/main.css. Keep the
+# two in step; if the palette there changes, change it here.
+base = "light"
+backgroundColor = "#f0ead6"           # --bg-void
+secondaryBackgroundColor = "#e8e0cc"  # --bg-panel
+textColor = "#1e2530"                 # --text-hi
+primaryColor = "#2e3d50"
+
+[browser]
+gatherUsageStats = false
