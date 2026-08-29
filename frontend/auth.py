@@ -54,6 +54,12 @@ _ROLE_LABEL = {
     "training_control": "Training Control",
 }
 
+# Order the login screen offers the roles in. Staff first, most-used first;
+# STUDENT last because it is the largest group but the one least likely to be
+# picked wrongly. Keys, not labels, so the value posted to the API is already
+# the wire form and no reverse lookup is needed.
+_LOGIN_ROLE_ORDER = ["hod", "instructor", "training_control", "student"]
+
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -148,17 +154,29 @@ def _error_detail(response) -> str:
     return detail if isinstance(detail, str) else ""
 
 
-def _attempt_login(username: str, password: str) -> Optional[str]:
+def _attempt_login(
+    username: str, password: str, expected_role: Optional[str] = None
+) -> Optional[str]:
     """POST /auth/login. Returns None on success, else a message to show.
 
     The cases are kept distinct on purpose: a dead backend and a wrong password
     are different problems, and collapsing them into "login failed" sends you
     debugging the wrong one.
+
+    expected_role is the role picked on the form. It is sent for the API to
+    check against the users row and is NOT checked here: comparing the returned
+    user's role in this process would mean the token had already been issued and
+    last_login_at already moved, so a mismatch would have logged a successful
+    sign-in before the UI thought better of it. Omitted when None, which is the
+    request this function has always sent.
     """
+    body = {"username": username, "password": password}
+    if expected_role:
+        body["expected_role"] = expected_role
     try:
         r = requests.post(
             f"{API_BASE}/auth/login",
-            json={"username": username, "password": password},
+            json=body,
             timeout=8,
         )
     except requests.exceptions.ConnectionError:
@@ -445,6 +463,18 @@ def _render_login_screen(expired: bool) -> None:
 
         # st.form so Enter submits, which is what a login box has to do.
         with st.form("login_form", clear_on_submit=False):
+            # Role first, above the credentials, and starting EMPTY. A default
+            # of any one role would be picked past without being read, which
+            # would make the confirmation worse than nothing - it would put a
+            # role on the screen that the person never actually chose.
+            role_choice = st.selectbox(
+                "Sign in as",
+                _LOGIN_ROLE_ORDER,
+                index=None,
+                placeholder="Select your role",
+                format_func=lambda r: _ROLE_LABEL[r],
+                key="_login_role",
+            )
             username = st.text_input("Username", autocomplete="username")
             password = st.text_input(
                 "Password", type="password", autocomplete="current-password"
@@ -452,10 +482,12 @@ def _render_login_screen(expired: bool) -> None:
             submitted = st.form_submit_button("SIGN IN", use_container_width=True)
 
         if submitted:
-            if not username or not password:
+            if not role_choice:
+                st.error("Select the role you are signing in as.")
+            elif not username or not password:
                 st.error("Enter both a username and a password.")
             else:
-                error = _attempt_login(username, password)
+                error = _attempt_login(username, password, role_choice)
                 if error:
                     st.error(error)
                 else:

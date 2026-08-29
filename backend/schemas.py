@@ -605,6 +605,15 @@ class LoginRequest(BaseModel):
     # attacker where the bcrypt 72-byte ceiling is. verify_password returns a
     # plain False for anything too long.
     password: str = Field(..., min_length=1)
+    # The role the person picked on the login screen before typing anything.
+    # A CONFIRMATION, NOT A GRANT: it can only ever cause a login to be
+    # refused, never to succeed with more access than the users row carries.
+    # The claims in the issued token are built from user.role, never from this.
+    #
+    # OPTIONAL, AND THAT IS DELIBERATE. Omitted, login behaves exactly as it did
+    # before this field existed, so scripts and any other API caller are
+    # unaffected; the login screen is the only caller that sends it.
+    expected_role: Optional[UserRole] = None
 
 
 class PasswordChangeRequest(BaseModel):

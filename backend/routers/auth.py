@@ -45,6 +45,23 @@ settings = get_settings()
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+# Human-readable role names for the login-screen confirmation. frontend/auth.py
+# and frontend/permissions.py each carry their own copy because Streamlit is a
+# separate process that cannot import this one; this is the API-side original,
+# and the three must agree.
+ROLE_LABEL = {
+    UserRole.HOD: "Head of Department",
+    UserRole.INSTRUCTOR: "Instructor",
+    UserRole.STUDENT: "Student",
+    UserRole.TRAINING_CONTROL: "Training Control",
+}
+_ROLE_ARTICLE = {
+    UserRole.HOD: "a",
+    UserRole.INSTRUCTOR: "an",
+    UserRole.STUDENT: "a",
+    UserRole.TRAINING_CONTROL: "a",
+}
+
 
 def _build_claims(user: User) -> dict:
     """The JWT payload. Role-shaped: an instructor carries what they may open,
@@ -80,6 +97,20 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
     dummy hash when the user does not exist). The is_active check runs only
     *after* the password is proven correct, so its different status code cannot
     be used to probe which usernames exist.
+
+    payload.expected_role — the role picked on the login screen — is checked in
+    that same position, and for that same reason. It is the role the person
+    SAYS they are, so a mismatch has to be reported specifically enough to be
+    useful ("this account is not an Instructor"), and a specific message ahead
+    of the password check would be an unauthenticated oracle: an attacker could
+    enumerate both usernames and their roles by watching which of the two
+    messages came back. After the password is proven, the caller has shown they
+    own the account, and naming its real role tells them nothing the token they
+    are about to receive would not.
+
+    The check can only ever REFUSE. Nothing downstream reads expected_role -
+    _build_claims works from user.role - so a login that succeeds grants exactly
+    what the users row says, whatever was picked on the form.
     """
     user = await crud.get_user_by_username(db, payload.username.strip())
 
@@ -93,6 +124,18 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "This account has been disabled"
+        )
+
+    # Refused BEFORE the token is minted and before last_login_at moves: a
+    # mismatched attempt must leave no trace of a successful sign-in, or the
+    # confirmation would be cosmetic.
+    if payload.expected_role is not None and user.role is not payload.expected_role:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"This account is not {_ROLE_ARTICLE[payload.expected_role]} "
+            f"{ROLE_LABEL[payload.expected_role]} — it is "
+            f"{_ROLE_ARTICLE[user.role]} {ROLE_LABEL[user.role]} account. "
+            f"Select the right role and sign in again.",
         )
 
     token = create_access_token(_build_claims(user))
