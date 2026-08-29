@@ -19,9 +19,12 @@ from auth import (
 from permissions import (
     PAGE_ADMIN,
     PAGE_ATTENDANCE,
+    PAGE_CLASSROOM_DASHBOARD,
+    PAGE_COURSE_OVERVIEW,
     PAGE_HOME,
     PAGE_LIVE_MONITOR,
     PAGE_STUDENT_DASHBOARD,
+    PAGE_STUDENT_PORTAL,
     PAGE_TRAINING_CONTROL,
     can_access,
     require_page_access,
@@ -167,6 +170,14 @@ with right:
 
     # Cards are filtered through PAGE_ACCESS, so Home never advertises a page
     # the signed-in role would be refused on arrival.
+    # EVERY non-Home page in PAGE_ACCESS must have a card here. The filter below
+    # hides what a role cannot open, but it cannot invent what was never listed:
+    # a page missing from this list is invisible to every role that owns it.
+    # Three were missing, and the gaps fell hardest on the roles with the fewest
+    # pages — STUDENT had no card at all, because student_portal (their ONLY
+    # page) was absent, which is what left the "no additional pages ... arrive in
+    # a later phase" placeholder on screen long after those pages shipped. HOD
+    # was missing course_overview, the flagship page of their own portal.
     _QUICK_ACTIONS = [
         (PAGE_LIVE_MONITOR, "📹 Live Monitor", "#00ff88",
          "Stream or upload classroom video for real-time recognition."),
@@ -174,10 +185,16 @@ with right:
          "View and export per-session attendance records."),
         (PAGE_STUDENT_DASHBOARD, "📊 Student Dashboard", "#ffd700",
          "Behavioural analytics charts and attention timelines."),
+        (PAGE_CLASSROOM_DASHBOARD, "🏫 Classroom Dashboard", "#4ad9c9",
+         "Room-level attendance and attention aggregates."),
+        (PAGE_COURSE_OVERVIEW, "🎓 Course Overview", "#7aa2f7",
+         "Every session in a course, rolled up across instructors."),
         (PAGE_ADMIN, "⚙️ Admin Panel", "#ff8c2b",
          "Register students, upload enrollment videos, rebuild gallery."),
         (PAGE_TRAINING_CONTROL, "🛠 Training Control", "#c586f0",
          "Add subjects, create instructor accounts, assign them to courses."),
+        (PAGE_STUDENT_PORTAL, "🎒 My Records", "#f5c842",
+         "Your own attendance and attention, session by session."),
     ]
 
     visible = [c for c in _QUICK_ACTIONS if can_access(role, c[0])]
@@ -198,10 +215,14 @@ with right:
                 unsafe_allow_html=True,
             )
     else:
-        st.info(
-            "No additional pages are available to your role yet. "
-            "Reports and setup screens arrive in a later phase."
-        )
+        # Unreachable for every role that exists today: permissions.py records
+        # that "every role now has at least one page of its own", and the list
+        # above covers all of them. Kept as an honest fallback for a role added
+        # later, and deliberately promising nothing — the message this replaced
+        # ("Reports and setup screens arrive in a later phase") went stale the
+        # moment those screens shipped, and then sat on the Student's Home page
+        # telling them their own portal did not exist yet.
+        st.info("Home is the only page available to your role.")
 
     # Refresh button
     if st.button("↺  Refresh Dashboard", use_container_width=True):
