@@ -175,6 +175,38 @@ async def update_student_embedding(
     )
 
 
+async def sync_gallery_indices(db: AsyncSession, positions: Dict[int, int]) -> int:
+    """Make students.gallery_index mirror the FAISS index exactly.
+
+    `positions` is {student_id: index} for every vector actually in the gallery.
+    Every OTHER student has their gallery_index cleared, because the column
+    means "this student's position in the FAISS index" and a student who is not
+    in the index has no position. Leaving a stale number there is what makes the
+    Admin panel show a student as embedded when the gallery no longer holds them.
+
+    WHY THIS EXISTS: rebuild_gallery() rebuilds FAISS from scratch, so every
+    vector gets a NEW position, but it never wrote those positions back. The
+    column kept whatever the last per-student /embed call had set, and the two
+    drifted apart silently — observed in the field as three students carrying
+    indices 28, 25 and 28 (a duplicate) when their real positions were 1, 2
+    and 6, with 1, 2 and 6 absent from the table altogether.
+
+    Returns the number of rows given an index.
+    """
+    await db.execute(
+        update(Student)
+        .where(Student.gallery_index.isnot(None))
+        .values(gallery_index=None)
+    )
+    for student_id, index in positions.items():
+        await db.execute(
+            update(Student)
+            .where(Student.id == student_id)
+            .values(gallery_index=index)
+        )
+    return len(positions)
+
+
 async def get_all_students_with_embeddings(db: AsyncSession) -> List[Student]:
     r = await db.execute(
         select(Student).where(

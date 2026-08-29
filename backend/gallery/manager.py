@@ -175,8 +175,25 @@ class GalleryManager:
 
     @property
     def student_ids(self) -> List[int]:
+        """The DISTINCT student ids in the gallery, in arbitrary order.
+
+        Goes through a set, so this answers "who is in the gallery" and nothing
+        else. It cannot be used to derive positions — see ordered_student_ids.
+        """
         with self._lock:
             return list(set(self._meta))
+
+    @property
+    def ordered_student_ids(self) -> List[int]:
+        """Student ids in FAISS row order: element i owns vector i.
+
+        Distinct from student_ids above, which passes through a set and so
+        loses both order and duplicates. This is the one that can be zipped
+        with range() to recover each student's gallery_index, which is what
+        rebuild_gallery writes back to the database.
+        """
+        with self._lock:
+            return list(self._meta)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

@@ -250,7 +250,17 @@ async def generate_embedding(
     dependencies=[Depends(require_instructor)],
 )
 async def rebuild_gallery(db: AsyncSession = Depends(get_db)):
-    """Rebuild the FAISS gallery from all embeddings stored in PostgreSQL."""
+    """Rebuild the FAISS gallery from all embeddings stored in PostgreSQL.
+
+    students.gallery_index is written back afterwards, and that is not
+    incidental. A rebuild gives every vector a NEW position, so without the
+    write-back the column keeps whatever the last per-student /embed call put
+    there and silently stops describing the gallery. That had already happened
+    here: three students carried indices 28, 25 and 28 — a duplicate — while
+    their real positions were 1, 2 and 6, and 1, 2 and 6 appeared nowhere in the
+    table. The Admin panel reads that column for its embedded/not-embedded
+    column, so the drift shows up as students being misreported.
+    """
     total, students = await crud.list_students(db, active_only=True, limit=10_000)
     failed: List[str] = []
     indexed = 0
@@ -269,6 +279,17 @@ async def rebuild_gallery(db: AsyncSession = Depends(get_db)):
             failed.append(f"{s.student_code}: {exc}")
 
     gallery.save()
+
+    # Mirror the index we just built. Read back from the gallery rather than
+    # from the loop above, so the column reflects what the gallery ACTUALLY
+    # holds — including anything add() rejected without raising.
+    # ordered_student_ids, NOT student_ids: the latter goes through a set, so it
+    # answers "who is in the gallery" while losing the row order that IS the
+    # index. Zipping it with range() would hand out plausible-looking positions
+    # that are simply wrong.
+    await crud.sync_gallery_indices(
+        db, {student_id: i for i, student_id in enumerate(gallery.ordered_student_ids)}
+    )
 
     return GalleryBuildResponse(
         success=True,
