@@ -255,8 +255,14 @@ def main() -> None:
             x1, y1, x2, y2 = (int(v) for v in bbox[:4])
             orig_face_w = x2 - x1
 
-            # Behavior analysis (EAR, yaw, pitch, label)
-            bf: BehaviorFrame = analyzer._analyze_one(frame, bbox, track_id=r.track_id)
+            # Behavior analysis (EAR, yaw, pitch, label). RetinaFace's own 5
+            # keypoints go in too: on frames where MediaPipe returns no landmarks
+            # they are the only pose signal left, and _analyze_one uses them to
+            # tell an extreme head turn from a marginal detection. Without them
+            # this tool would report UNKNOWN where the pipeline reports
+            # DISTRACTED — see _kps_yaw_index in backend/pipeline/behavior.py.
+            bf: BehaviorFrame = analyzer._analyze_one(
+                frame, bbox, track_id=r.track_id, kps=r.landmarks)
 
             # Reproduce _crop_face exactly (BGR, 256x256), then convert to RGB for
             # MediaPipe so the landmarks — and the CNN eye crops derived from them

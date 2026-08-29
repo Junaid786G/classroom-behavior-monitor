@@ -24,6 +24,14 @@ class RecognitionResult:
     track_id: int
     bbox_xyxy: np.ndarray          # [x1, y1, x2, y2] absolute pixels
     detection_score: float
+    # RetinaFace's own 5 keypoints (eyes, nose, mouth corners) for this face, in
+    # absolute pixels. Carried through because they are the ONLY pose signal
+    # available on frames where MediaPipe FaceLandmarker returns nothing, which
+    # is precisely what happens when a head is turned far enough — see
+    # _kps_yaw_index in backend/pipeline/behavior.py. Detections synthesised by
+    # _match_tracks_to_dets carry an all-zero placeholder, which _kps_yaw_index
+    # rejects as degenerate.
+    landmarks: Optional[np.ndarray] = None
     embedding: Optional[np.ndarray] = None
     student_id: Optional[int] = None
     student_name: Optional[str] = None
@@ -126,6 +134,7 @@ class FaceRecognizer:
                     track_id=track.track_id,
                     bbox_xyxy=track.bbox_xyxy,
                     detection_score=det.score,
+                    landmarks=det.landmarks,
                     embedding=emb,
                     student_id=voted_sid,
                     student_name=name,

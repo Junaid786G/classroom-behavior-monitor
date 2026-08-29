@@ -54,6 +54,9 @@ _POSE_PITCH_HEAD_DOWN = get_settings().behavior_pitch_head_down   # pitch-only h
 _YAW_DEVIATION        = get_settings().behavior_yaw_deviation     # |yaw − own median| above this ⇒ looking away
 _PITCH_DEVIATION      = get_settings().behavior_pitch_deviation   # pitch above own median by this ⇒ head down
 _CARRY_FORWARD_MAX    = 3      # max consecutive no-landmark frames to carry last behavior forward
+_YAW_ABSOLUTE_EXTREME = get_settings().behavior_yaw_absolute      # |yaw| this far off-axis is looking away for ANYONE
+_PITCH_ABSOLUTE_EXTREME = get_settings().behavior_pitch_absolute  # pitch this far down is head-down for ANYONE
+_KPS_YAW_EXTREME      = get_settings().behavior_kps_yaw_extreme   # extreme-yaw bar on RetinaFace's own 5 keypoints
 _EYE_STATE_METHOD     = get_settings().eye_state_method   # "cnn" = ONNX eye-state gate, "ear" = EAR-only
 
 
@@ -93,6 +96,49 @@ def _rotation_to_euler(mat4x4) -> Tuple[float, float, float]:
     pitch, yaw, roll = Rotation.from_matrix(R).as_euler('xyz', degrees=True)
     return float(pitch), float(yaw), float(roll)
 
+
+
+def _kps_yaw_index(kps) -> Optional[float]:
+    """Scale-free extreme-yaw measure from RetinaFace's OWN 5 keypoints, or None
+    when they are degenerate/absent.
+
+    WHY THIS EXISTS: MediaPipe FaceLandmarker is the only source of a measured
+    yaw angle, so on the frames where it returns nothing there is no pose reading
+    at all — and those frames are not random. On real footage the landmark
+    failure rate among high-confidence detections is flat at ~2% out to roughly
+    30 deg of yaw and then climbs to 44% beyond ~48 deg (classroom), and at
+    close-up scale EVERY landmark failure measured (24/24) was an extreme turn.
+    RetinaFace has already located the eyes, nose and mouth corners by then, so
+    the detector itself still knows the head is turned.
+
+    THE UNITS ARE THE POINT: this is the nose's offset along the eye axis
+    normalised by the eye-line -> mouth-line extent, NOT by inter-ocular
+    distance. IOD shrinks as the head turns, so nose/IOD blows up super-linearly
+    and calibrates differently at every viewpoint — 121 deg per unit on the
+    classroom clip against 56 on close-up webcam footage, a 2.26x disagreement
+    that no single threshold survives. The eye->mouth extent lies along the yaw
+    axis and barely moves with it, which cuts the disagreement to 1.33x (fitted
+    on 15,507 classroom and 1,948 close-up frames where MediaPipe DID work, so
+    true yaw was known). The residual 1.33x is the classroom camera's downward
+    tilt from its top-centre mount, which foreshortens horizontal displacement.
+    """
+    if kps is None:
+        return None
+    pts = np.asarray(kps, dtype=float)
+    if pts.shape != (5, 2) or not np.isfinite(pts).all():
+        return None
+    left_eye, right_eye, nose, mouth_l, mouth_r = pts
+    eye_vec = right_eye - left_eye
+    iod = float(np.hypot(*eye_vec))
+    if iod < 1e-3:                      # synthesised all-zero placeholder, or a
+        return None                     # degenerate detection: no pose to read
+    axis_x = eye_vec / iod                          # along the eye line
+    axis_y = np.array([-axis_x[1], axis_x[0]])      # down the face
+    eye_mid = (left_eye + right_eye) / 2.0
+    face_v = float(np.dot((mouth_l + mouth_r) / 2.0 - eye_mid, axis_y))
+    if abs(face_v) < 1e-3:
+        return None
+    return abs(float(np.dot(nose - eye_mid, axis_x)) / face_v)
 
 
 def _padded_face_box(frame: np.ndarray, bbox: np.ndarray,
@@ -243,6 +289,27 @@ class BehaviorAnalyzer:
         test — looking down relative to one's own resting pitch counts, looking up
         does not.
         """
+        # An absolute ceiling that the baseline cannot argue away. The deviation
+        # test alone has a blind spot: _pose_baseline's median window is fed by
+        # every measured frame, so a turn HELD long enough becomes the track's own
+        # median and the deviation collapses to zero — the student then reads as
+        # resting at 40 deg off-axis. Observed directly on real footage: a head
+        # held at -38 deg for nine consecutive samples produced deviation ~0.
+        # 40 deg is above any real resting pose measured on test_clip_8min.mp4
+        # (the most angled of 24 seats rests at 30.6 deg; frame-level |yaw| p99 is
+        # 34.1) and no seat sustains even 35 deg for the 5 s the dwell timer
+        # needs, so this adds no false DISTRACTED episodes on that footage while
+        # keeping the side-column fix intact.
+        # Pitch needs the identical ceiling and for the identical reason: a
+        # student who looks down at a phone for a minute has that pitch absorbed
+        # into their own median within ~8 samples and silently reverts to
+        # ATTENTIVE. One-sided, preserving the head-down semantics — looking UP
+        # off one's baseline still does not count. 40 deg clears the top-centre
+        # mount's positive pitch bias by a wide margin: the most head-tipped of
+        # 24 real seats rests at 23.0 deg, frame-level p99.9 is 34.8, and the
+        # longest run above 40 in the whole clip is 0.4 s against a 5 s dwell.
+        if abs(yaw) >= _YAW_ABSOLUTE_EXTREME or pitch >= _PITCH_ABSOLUTE_EXTREME:
+            return True
         if baseline_yaw is None or baseline_pitch is None:
             return pitch > _POSE_PITCH_HEAD_DOWN or abs(yaw) > _YAW_THRESHOLD
         return (pitch - baseline_pitch > _PITCH_DEVIATION
@@ -278,6 +345,48 @@ class BehaviorAnalyzer:
             return BehaviorFrame(track_id=track_id, behavior=last, confidence=0.40)
         return BehaviorFrame(track_id=track_id, behavior=BehaviorType.UNKNOWN, confidence=0.0)
 
+    def _no_landmarks(self, track_id: int, kps, timestamp_ms: float) -> "BehaviorFrame":
+        """Decide a frame on which MediaPipe returned no landmarks at all.
+
+        Previously this was an unconditional _carry_or_unknown, which replays the
+        last confident behaviour for _CARRY_FORWARD_MAX frames and then reports
+        UNKNOWN. That is right for a momentary dropout but wrong for the case it
+        was silently absorbing: a head turned far enough that the landmarker
+        cannot fit a mesh at all. The face is plainly visible — RetinaFace boxed
+        it — so UNKNOWN is not the honest answer, DISTRACTED is.
+
+        The two causes are separated by RetinaFace's own keypoints, because they
+        are NOT the same population. Of the landmark failures measured on the
+        classroom clip only 1.7% clear _KPS_YAW_EXTREME (median index 0.059):
+        the rest are small marginal detections that fail for want of pixels, not
+        pose, and they keep the old carry-forward path. At close-up scale 100%
+        of failures clear it (median index 0.405). A blanket "no landmarks ⇒
+        distracted" rule would have mislabelled the entire classroom remainder.
+
+        SLEEPING outranks this. Eye state is unmeasurable without landmarks, so a
+        track confirmed SLEEPING moments ago keeps that label through the same
+        carry window rather than being demoted to DISTRACTED by the turn — a
+        student can be both asleep and facing away.
+        """
+        yaw_index = _kps_yaw_index(kps)
+        if yaw_index is None or yaw_index < _KPS_YAW_EXTREME:
+            return self._carry_or_unknown(track_id)
+
+        last  = self._last_behavior.get(track_id)
+        count = self._carry_count.get(track_id, 0)
+        if last is BehaviorType.SLEEPING and count < _CARRY_FORWARD_MAX:
+            self._carry_count[track_id] = count + 1
+            return BehaviorFrame(track_id=track_id, behavior=BehaviorType.SLEEPING,
+                                 confidence=0.40,
+                                 pose_metrics={"kps_yaw_index": yaw_index})
+
+        self._sleeping_since[track_id] = None
+        behavior, confidence = self._distracted_dwell(track_id, 0.75, 0.75, timestamp_ms)
+        self._record(track_id, behavior)
+        return BehaviorFrame(track_id=track_id, behavior=behavior,
+                             confidence=confidence,
+                             pose_metrics={"kps_yaw_index": yaw_index})
+
     def warmup(self) -> None:
         opts = mp_vision.FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=_MODEL_PATH),
@@ -292,7 +401,8 @@ class BehaviorAnalyzer:
         logger.info("BehaviorAnalyzer: FaceLandmarker ready (crop-then-analyze)")
 
     def analyze(self, frame: np.ndarray, bbox: np.ndarray, landmarks=None, timestamp_ms: float = 0.0):
-        bf = self._analyze_one(frame, np.asarray(bbox), timestamp_ms=timestamp_ms)
+        bf = self._analyze_one(frame, np.asarray(bbox), timestamp_ms=timestamp_ms,
+                               kps=landmarks)
         return bf.behavior, bf.confidence
 
     def analyze_frame(self, frame: np.ndarray, results, timestamp_ms: float) -> List[BehaviorFrame]:
@@ -303,20 +413,24 @@ class BehaviorAnalyzer:
             if bbox is None or not self._ready:
                 out.append(BehaviorFrame(track_id=tid, behavior=BehaviorType.UNKNOWN, confidence=0.0))
                 continue
-            out.append(self._analyze_one(frame, bbox, track_id=tid, timestamp_ms=timestamp_ms))
+            out.append(self._analyze_one(frame, bbox, track_id=tid, timestamp_ms=timestamp_ms,
+                                         kps=getattr(r, "landmarks", None)))
         return out
 
-    def _analyze_one(self, frame: np.ndarray, bbox: np.ndarray, track_id: int = -1, timestamp_ms: float = 0.0) -> BehaviorFrame:
+    def _analyze_one(self, frame: np.ndarray, bbox: np.ndarray, track_id: int = -1,
+                     timestamp_ms: float = 0.0, kps=None) -> BehaviorFrame:
         fallback = BehaviorFrame(track_id=track_id, behavior=BehaviorType.UNKNOWN, confidence=0.0)
         try:
             crop_bgr = _crop_face(frame, bbox)
             if crop_bgr is None:
                 return self._carry_or_unknown(track_id)   # carry-forward on crop failure
+            kps_extreme_yaw = (_kps_yaw_index(kps) or 0.0) >= _KPS_YAW_EXTREME
             crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
             det    = self._lm.detect(mp_img)
             if not det.face_landmarks:
-                return self._carry_or_unknown(track_id)   # carry-forward on no landmarks
+                # No mesh: fall back to RetinaFace's own keypoints before giving up.
+                return self._no_landmarks(track_id, kps, timestamp_ms)
             lms = det.face_landmarks[0]
             ear_left  = _ear(lms, _LEFT_EYE)
             ear_right = _ear(lms, _RIGHT_EYE)
@@ -397,8 +511,26 @@ class BehaviorAnalyzer:
                 # skipped in "cnn" mode. Head-down (pitch) and looking-away (yaw) both count
                 # as DISTRACTED now (HEAD_DOWN merged in). Prefer UNKNOWN when pose is
                 # unremarkable, over a likely misclassification.
+                #
+                # kps_extreme_yaw is OR-ed in because this branch is reached most
+                # often for a reason that is NOT unreliable landmarks: a turned
+                # head foreshortens the far eye, which inflates its EAR and blows
+                # |EAR_left - EAR_right| past _EYE_ASYM_MAX. On real footage the
+                # gate trips on 0.0% of frames below 10 deg of yaw but 80-91%
+                # above 40, so it is in practice a yaw detector. When the pose is
+                # unremarkable to _pose_off_axis yet the detector's own keypoints
+                # say the head is turned far, "unknown" is the wrong answer —
+                # observed on real frames sitting at -38 deg, where the baseline
+                # had absorbed the turn and this branch emitted UNKNOWN.
+                #
+                # SLEEPING is NOT lost to this branch: closing both eyes drives
+                # both EARs toward zero, so their absolute difference stays small
+                # and the gate does not trip. Verified on the classroom clip —
+                # 228 frames at |yaw| >= 25 with mean EAR < 0.10 (genuine
+                # closures) and not one of them trips _EYE_ASYM_MAX.
                 self._sleeping_since[track_id] = None
-                if self._pose_off_axis(yaw, pitch, baseline_yaw, baseline_pitch):
+                if (self._pose_off_axis(yaw, pitch, baseline_yaw, baseline_pitch)
+                        or kps_extreme_yaw):
                     behavior, confidence = self._distracted_dwell(track_id, 0.70, 0.70, timestamp_ms)
                 else:
                     self._distracted_since[track_id] = None

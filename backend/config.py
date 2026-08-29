@@ -71,6 +71,28 @@ class Settings(BaseSettings):
     behavior_pitch_deviation: float = Field(15.0, ge=0.0, le=90.0)
     behavior_sleep_ratio: float = Field(0.45, ge=0.0, le=1.0)
     behavior_sleeping_seconds: float = Field(1.5, ge=0.0, le=10.0)
+    # A yaw this far off-axis is looking away no matter WHOSE head it is, so it
+    # bypasses the per-track baseline in _pose_off_axis. Needed because a turn
+    # held long enough gets absorbed into the track's own median and then reads
+    # as that student's resting pose. Sized from test_clip_8min.mp4: the most
+    # angled of 24 real seats rests at 30.6 deg and frame-level |yaw| p99 is
+    # 34.1, while no seat sustains even 35 deg for the 5 s the dwell timer needs.
+    behavior_yaw_absolute: float = Field(40.0, ge=0.0, le=90.0)
+    # The same ceiling on the pitch axis, one-sided (looking DOWN only), and for
+    # the same reason: a head-down posture held for more than a few samples
+    # becomes that track's own median and stops registering. Sized against the
+    # top-centre camera mount, which tilts every measured pitch positive — real
+    # seats rest as tipped as 23.0 deg and frame-level pitch p99.9 is 34.8, while
+    # the longest run above 40 deg anywhere in test_clip_8min.mp4 is 0.4 s
+    # against the 5 s the dwell timer needs.
+    behavior_pitch_absolute: float = Field(40.0, ge=0.0, le=90.0)
+    # Extreme-yaw bar on RetinaFace's OWN 5 keypoints, used where MediaPipe
+    # returned no landmarks and there is no other pose measurement. Units are
+    # |nose offset along the eye axis| / (eye-line -> mouth-line extent); see
+    # _kps_yaw_index. 0.25 flags 100% of close-up landmark failures and 1.7% of
+    # classroom ones -- the classroom remainder being small marginal detections,
+    # which is exactly the population that must NOT be called distracted.
+    behavior_kps_yaw_extreme: float = Field(0.25, ge=0.0, le=5.0)
     # Default "ear" from frame-level validation on 2026-08-19: the CNN gate measured
     # a 58% false-positive rate (35/60 measured SLEEPING events had eyes objectively
     # open) against 0% (0/66) for EAR on identical frames. This supersedes the

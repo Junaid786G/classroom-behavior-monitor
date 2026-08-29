@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.pipeline.behavior import (  # noqa: E402
     _LEFT_EYE, _MODEL_PATH, _RIGHT_EYE, _ear, _padded_face_box,
+    _rotation_to_euler,
 )
 
 import mediapipe as mp  # noqa: E402
@@ -58,6 +59,14 @@ OPEN_WINDOW = range(5000, 5201, 10)
 CLOSEUP_SIZE = (420, 236)
 SEAT_CELL = 70          # px grid used to group detections into seats
 PER_CLASS = 6           # fixtures per (scale, eye-state) combination
+# Candidates are ranked by EAR, so without a pose filter "highest EAR" quietly
+# selects "most turned head" rather than "most open eye": yaw foreshortens the
+# eye's horizontal extent, which is EAR's denominator. Measured on the close-up
+# set this produced open-eye fixtures at |yaw| 60-68 deg with EAR up to 2.04
+# against a normal 0.2-0.4, and the inflated open baseline made
+# test_closed_eyes_clear_the_sleep_ratio_against_open_baseline pass trivially.
+# Both eye states are therefore selected from near-frontal frames only.
+FRONTAL_MAX_YAW = 20.0
 
 
 def _landmarker():
@@ -72,8 +81,9 @@ def _landmarker():
 
 
 def _ear_of(lm, frame, bbox):
-    """EAR through the CURRENT pipeline crop -- used only to sort frames into
-    open/closed here, never as an assertion."""
+    """(EAR, |yaw|) through the CURRENT pipeline crop -- used only to sort frames
+    into open/closed here, never as an assertion. |yaw| accompanies it so turned
+    heads can be kept out of the ranking; see FRONTAL_MAX_YAW."""
     box = _padded_face_box(frame, np.asarray(bbox, dtype=float))
     if box is None:
         return None
@@ -87,7 +97,10 @@ def _ear_of(lm, frame, bbox):
     if not det.face_landmarks:
         return None
     pts = det.face_landmarks[0]
-    return (_ear(pts, _LEFT_EYE) + _ear(pts, _RIGHT_EYE)) / 2.0
+    yaw = 0.0
+    if det.facial_transformation_matrixes:
+        yaw = abs(_rotation_to_euler(det.facial_transformation_matrixes[0])[1])
+    return (_ear(pts, _LEFT_EYE) + _ear(pts, _RIGHT_EYE)) / 2.0, yaw
 
 
 def _read(src: Path, idxs):
@@ -146,9 +159,9 @@ def classroom_fixtures(app, lm, manifest):
                 bbox = [float(v) for v in f.bbox]
                 key = (int((bbox[0] + bbox[2]) / 2) // SEAT_CELL,
                        int((bbox[1] + bbox[3]) / 2) // SEAT_CELL)
-                e = _ear_of(lm, frame, bbox)
-                if e is not None:
-                    seats[key][window].append((int(i), bbox, e))
+                measured = _ear_of(lm, frame, bbox)
+                if measured is not None and measured[1] <= FRONTAL_MAX_YAW:
+                    seats[key][window].append((int(i), bbox, measured[0]))
 
     ranked = [
         (float(np.median([r[2] for r in v["sleep"]])), k)
@@ -187,9 +200,9 @@ def closeup_fixtures(app, lm, manifest):
         if fi % 2 == 0:
             f = _biggest(app, frame)
             if f is not None:
-                e = _ear_of(lm, frame, [float(v) for v in f.bbox])
-                if e is not None:
-                    scored.append((e, fi, [float(v) for v in f.bbox]))
+                measured = _ear_of(lm, frame, [float(v) for v in f.bbox])
+                if measured is not None and measured[1] <= FRONTAL_MAX_YAW:
+                    scored.append((measured[0], fi, [float(v) for v in f.bbox]))
         fi += 1
     cap.release()
     if len(scored) < 2 * PER_CLASS:
