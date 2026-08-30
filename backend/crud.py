@@ -501,7 +501,24 @@ async def end_session(
     if summary:
         vals["summary"] = summary
     await db.execute(update(Session).where(Session.id == session_id).values(**vals))
-    await reconcile_absent_students(db, session_id)
+    # Absence is only meaningful for a class that actually ran. This used to be
+    # unconditional, so a session that crashed before its camera opened — 0
+    # frames, started and ended a tenth of a second apart — was written up
+    # exactly like a real class nobody turned up to: an ABSENT row for every
+    # enrolled student on the course.
+    #
+    # That is not just noise in one table. get_course_overview derives
+    # has_attendance as `bool(counts)`, so ANY row makes a session count as
+    # documented: a failed connection attempt was pulled into sessions_counted
+    # and total_absent, and Course Overview rendered Present/Late/Absent for it
+    # instead of an em dash. One session (bd4e338e) carried 15 such rows.
+    #
+    # Guarded on COMPLETED specifically rather than on `status is not FAILED`,
+    # so a status added to SessionStatus later has to opt IN to writing
+    # absences rather than inheriting them by default — the same closed form
+    # ck_users_student_link and permissions.PAGE_ACCESS both use.
+    if status is SessionStatus.COMPLETED:
+        await reconcile_absent_students(db, session_id)
     await db.commit()
     return await get_session(db, session_id)
 
