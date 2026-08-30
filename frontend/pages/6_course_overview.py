@@ -26,7 +26,7 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_COURSE_OVERVIEW, require_page_access
-from ui import as_display as _as_display
+from ui import as_display as _as_display, format_session_when
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -99,13 +99,9 @@ def _session_label(row: dict) -> str:
     Never Session.subject: that free-text column predates the subjects table
     and holds whatever was typed at the time.
     """
-    when = "not started"
-    if row.get("started_at"):
-        try:
-            dt = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
-            when = dt.strftime("%b %d, %H:%M")
-        except ValueError:
-            when = row["started_at"]
+    # Delegates to the shared formatter so this page's "not started" and every
+    # other page's rendering of a NULL started_at cannot drift apart again.
+    when = format_session_when(row.get("started_at"))
     archived = "" if row.get("subject_is_active", True) else "  [archived]"
     return f"{row['subject_code']} {row['subject_name']} — {when}{archived}"
 
@@ -266,11 +262,9 @@ table = pd.DataFrame([
         "Status": _STATUS_ICON.get(s["status"], "?") + " " + s["status"].upper(),
         "Subject": f"{s['subject_code']} {s['subject_name']}"
                    + ("" if s["subject_is_active"] else "  [archived]"),
-        "Started": (
-            datetime.fromisoformat(s["started_at"].replace("Z", "+00:00"))
-            .strftime("%Y-%m-%d %H:%M")
-            if s.get("started_at") else "—"
-        ),
+        # "—" here vs "not started" from _session_label above was the same row
+        # rendered two ways on one page. Both go through the shared formatter now.
+        "Started": format_session_when(s.get("started_at"), fmt="%Y-%m-%d %H:%M"),
         "Instructor": s.get("instructor") or "—",
         "Present": s["present"] if s["has_attendance"] else None,
         "Late": s["late"] if s["has_attendance"] else None,

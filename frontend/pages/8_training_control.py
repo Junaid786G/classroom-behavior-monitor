@@ -40,6 +40,7 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_TRAINING_CONTROL, require_page_access
+from ui import format_session_when
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -582,7 +583,7 @@ with tab_rollover:
                 {
                     "Status": (s.get("status") or "—").upper(),
                     "Title": s.get("title") or s.get("subject") or "—",
-                    "Started": (s.get("started_at") or "—")[:16].replace("T", " "),
+                    "Started": format_session_when(s.get("started_at")),
                 }
                 for s in doomed
             ]))

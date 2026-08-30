@@ -30,7 +30,7 @@ from permissions import (
     can_access,
     require_page_access,
 )
-from ui import session_delete_widget
+from ui import format_session_when, session_delete_widget
 
 # ── Page config (must be first Streamlit call) ────────────────────────────────
 st.set_page_config(
@@ -169,20 +169,17 @@ with left:
                 "failed":     "❌",
             }.get(s.get("status", ""), "?")
 
-            started = s.get("started_at", "")
-            if started:
-                try:
-                    started = datetime.fromisoformat(started.replace("Z", "+00:00"))
-                    started = started.strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    pass
-
             rows.append({
                 "Status":   status_icon + " " + s.get("status", "—").upper(),
                 "Title":    s.get("title") or s.get("subject") or "—",
                 "Instructor": s.get("instructor") or "—",
                 "Frames":   s.get("total_frames_processed", 0),
-                "Started":  started or "—",
+                # Shared formatter: this page used to print a bare "—" for a
+                # missing start while Course Overview said "not started" for the
+                # same row. 25 of 74 sessions have no started_at, so the two
+                # disagreed on a third of every list.
+                "Started":  format_session_when(s.get("started_at"),
+                                                fmt="%Y-%m-%d %H:%M"),
             })
 
         import pandas as pd

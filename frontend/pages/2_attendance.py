@@ -21,6 +21,7 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_ATTENDANCE, can_write_attendance, require_page_access
+from ui import filter_sessions, format_session_when, resolve_session_context
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -92,6 +93,23 @@ def _sessions(user_id: int, classroom_id=None):
     return d.get("items", [])
 
 
+@st.cache_data(ttl=30)
+def _catalogue(user_id: int):
+    """{subject_id: subject}, {course_id: course} for this instance.
+
+    Fetched here because SessionOut carries subject_id and nothing else about
+    it — no code, no course. Every label and filter below needs the join, and
+    ui.filter_sessions/resolve_session_context take these two indexes.
+    """
+    courses = (_get("/courses", params={"active_only": False}) or {}).get("items", [])
+    subject_index = {}
+    for c in courses:
+        for sub in (_get(f"/courses/{c['id']}/subjects",
+                         params={"active_only": False}) or {}).get("items", []):
+            subject_index[sub["id"]] = sub
+    return subject_index, {c["id"]: c for c in courses}
+
+
 @st.cache_data(ttl=8)
 def _attendance(user_id: int, session_id: str):
     d = _get(f"/sessions/{session_id}/attendance", params={"include_student": "true"}) or {}
@@ -126,11 +144,41 @@ with st.sidebar:
         title = s.get("title") or s.get("subject") or "Untitled"
         status = s.get("status", "")
         icon = {"completed": "✅", "processing": "⚙️", "failed": "❌"}.get(status, "⏳")
-        return f"{icon} {title}"
+        # The date is part of the label, not decoration: several sessions share
+        # a title, and without it the picker offers indistinguishable options.
+        return f"{icon} {title} · {format_session_when(s.get('started_at'))}"
+
+    # Course -> subject -> session, narrowing left to right. The filter keys on
+    # subject_id, NEVER classroom_id: one room hosts many subjects, so a
+    # room-based filter would return another course's sessions under this
+    # course's heading. See the note above ui.filter_sessions.
+    subject_index, course_index = _catalogue(cache_user_id())
+
+    course_opts = {"All courses": None}
+    course_opts.update({f"{c['code']} — {c['name']}": c["id"]
+                        for c in course_index.values()})
+    course_pick = st.selectbox("Course", list(course_opts.keys()), key="att_course")
+    course_id = course_opts[course_pick]
+
+    subject_opts = {"All subjects": None}
+    subject_opts.update({
+        f"{sub['subject_code']}  {sub['subject_name']}": sub["id"]
+        for sub in subject_index.values()
+        if course_id is None or sub.get("course_id") == course_id
+    })
+    subject_pick = st.selectbox("Subject", list(subject_opts.keys()), key="att_subject")
+    subject_id = subject_opts[subject_pick]
+
+    sessions = filter_sessions(sessions, subject_index,
+                               course_id=course_id, subject_id=subject_id)
+    if not sessions:
+        st.warning("No sessions match this course/subject.")
+        st.stop()
 
     session_map = {_session_label(s): s["id"] for s in sessions}
     chosen_label = st.selectbox("Session", list(session_map.keys()))
     session_id = session_map[chosen_label]
+    chosen_session = next(s for s in sessions if s["id"] == session_id)
 
     st.divider()
     status_filter = st.multiselect(
@@ -153,6 +201,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Summary metrics ───────────────────────────────────────────────────────────
+# #7: every number below belongs to ONE session on ONE date. Without this line
+# the five metrics are unattributed — they read as department totals.
+_ctx = resolve_session_context([chosen_session], subject_index, course_index)
+st.caption(
+    f"**{_ctx['subject_label']}**  ·  course {_ctx['course_label']}"
+    f"  ·  {format_session_when(chosen_session.get('started_at'))}"
+    f"  ·  instructor {_ctx['instructor_label']}"
+)
+
 summary = _summary(cache_user_id(), session_id)
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Enrolled",  summary.get("total_enrolled", "—"))
@@ -184,8 +241,8 @@ with table_col:
                 "Status":     _STATUS_ICON.get(status, "?") + " " + status.upper(),
                 "Confidence": f"{rec['avg_confidence']:.1%}" if rec.get("avg_confidence") else "—",
                 "Frames":     rec.get("confirmed_frame_count", 0),
-                "First Seen": (rec.get("first_seen_at") or "—")[:16].replace("T", " "),
-                "Last Seen":  (rec.get("last_seen_at")  or "—")[:16].replace("T", " "),
+                "First Seen": format_session_when(rec.get("first_seen_at")),
+                "Last Seen":  format_session_when(rec.get("last_seen_at")),
                 "_id":        rec["student_id"],
                 "_status":    status,
             })

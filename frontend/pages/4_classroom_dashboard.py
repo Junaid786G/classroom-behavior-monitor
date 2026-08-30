@@ -21,6 +21,7 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_CLASSROOM_DASHBOARD, require_page_access
+from ui import format_session_when, resolve_session_context
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -89,6 +90,20 @@ def _get(path, **kw):
 def _classrooms(user_id: int):
     d = _get("/classrooms") or {}
     return d.get("items", [])
+
+
+@st.cache_data(ttl=30)
+def _catalogue(user_id: int):
+    """{subject_id: subject}, {course_id: course}. Needed because SessionOut
+    carries subject_id and no code, and because Session.subject (free text) is
+    not a trustworthy substitute — see the note at the Subject column below."""
+    courses = (_get("/courses", params={"active_only": False}) or {}).get("items", [])
+    subject_index = {}
+    for c in courses:
+        for sub in (_get(f"/courses/{c['id']}/subjects",
+                         params={"active_only": False}) or {}).get("items", []):
+            subject_index[sub["id"]] = sub
+    return subject_index, {c["id"]: c for c in courses}
 
 
 @st.cache_data(ttl=10)
@@ -161,6 +176,16 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── Gather + aggregate all sessions for this classroom ────────────────────────
+subject_index, course_index = _catalogue(cache_user_id())
+
+
+def _subject_label(sess: dict) -> str:
+    sub = subject_index.get(sess.get("subject_id"))
+    if sub:
+        return f"{sub['subject_code']} {sub['subject_name']}"
+    return sess.get("subject") or sess.get("title") or "—"
+
+
 all_sessions = _sessions(cache_user_id(), classroom_id)
 # defensive client-side filter (API already filters, but the task calls for it)
 sessions = [s for s in all_sessions if s.get("classroom_id") == classroom_id]
@@ -210,7 +235,12 @@ with st.spinner("Aggregating session analytics…"):
         rows.append({
             "Date":        d.date().isoformat() if d is not None else "—",
             "_dt":         d,
-            "Subject":     s.get("subject") or s.get("title") or "—",
+            # Resolved through subject_id, NOT Session.subject. That free-text
+            # column predates the subjects table and holds whatever was typed at
+            # the time — 6_course_overview._session_label carries the same
+            # warning. The free text is kept only as a last resort for a session
+            # whose subject is missing from the catalogue.
+            "Subject":     _subject_label(s),
             "Instructor":  s.get("instructor") or "—",
             "Present":     present,
             "Absent":      absent,
@@ -218,6 +248,22 @@ with st.spinner("Aggregating session analytics…"):
             "Attendance":  rate if rate is not None else None,
             "Avg attn %":  avg_attn if avg_attn is not None else None,
         })
+
+# #5: what these charts actually cover. A ROOM IS NOT A COURSE — room 1 in this
+# database hosts 3 subjects — so this names the whole set present rather than
+# collapsing to whichever sorts first. resolve_session_context only prints a
+# single name when there genuinely is one. Collapsing here would be a fresh
+# instance of the room-versus-course confusion reconcile_absent_students
+# documents, and the reason _gate_to_roster scopes by course and never by room.
+_ctx = resolve_session_context(sessions, subject_index, course_index)
+_first = min((s.get("started_at") for s in sessions if s.get("started_at")), default=None)
+_last = max((s.get("started_at") for s in sessions if s.get("started_at")), default=None)
+st.caption(
+    f"**{len(sessions)} session(s)** in this room  ·  course {_ctx['course_label']}"
+    f"  ·  {_ctx['subject_label']}  ·  instructor {_ctx['instructor_label']}"
+    + (f"  ·  {format_session_when(_first)} — {format_session_when(_last)}"
+       if _first else "  ·  no recorded dates")
+)
 
 total_sessions = len(sessions)
 avg_rate = rate_sum / rate_count if rate_count else 0.0

@@ -30,7 +30,8 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_LIVE_MONITOR, require_page_access
-from ui import as_display as _as_display, session_delete_widget
+from ui import (as_display as _as_display, format_session_when,
+                session_delete_widget)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -672,7 +673,7 @@ if not st.session_state.session_id:
                 {
                     "Status": s.get("status", "—").upper(),
                     "Title": s.get("title") or s.get("subject") or "—",
-                    "Started": (s.get("started_at") or "—")[:16].replace("T", " "),
+                    "Started": format_session_when(s.get("started_at")),
                     "Frames": s.get("total_frames_processed", 0),
                 }
                 for s in my_sessions
@@ -694,7 +695,7 @@ if not st.session_state.session_id:
         completed = [s for s in my_sessions if s.get("status") == "completed"]
         opts = {
             f"{s.get('title') or s.get('subject', '?')}"
-            f" · {(s.get('started_at') or '')[:16].replace('T', ' ')}": s["id"]
+            f" · {format_session_when(s.get('started_at'))}": s["id"]
             for s in completed
         }
         st.caption(

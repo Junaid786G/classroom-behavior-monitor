@@ -26,7 +26,7 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_STUDENT_PORTAL, require_page_access
-from ui import as_display as _as_display
+from ui import as_display as _as_display, format_session_when
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -88,12 +88,11 @@ def _pct(value) -> str:
 
 
 def _when(iso: str) -> str:
-    if not iso:
-        return "—"
-    try:
-        return datetime.fromisoformat(iso.replace("Z", "+00:00")).strftime("%b %d, %H:%M")
-    except ValueError:
-        return iso
+    """Kept as a thin alias so the call sites below read unchanged; the rendering
+    itself is ui.format_session_when, shared with every other page. This used to
+    return an em dash for a missing date while course_overview returned "not
+    started" for the same row."""
+    return format_session_when(iso)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────

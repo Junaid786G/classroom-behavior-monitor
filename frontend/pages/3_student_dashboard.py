@@ -21,6 +21,7 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_STUDENT_DASHBOARD, require_page_access
+from ui import filter_sessions, format_session_when, resolve_session_context
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -87,6 +88,19 @@ def _students(user_id: int, classroom_id=None):
         p["classroom_id"] = classroom_id
     d = _get("/students", params=p) or {}
     return d.get("items", [])
+
+
+@st.cache_data(ttl=30)
+def _catalogue(user_id: int):
+    """{subject_id: subject}, {course_id: course}. SessionOut has subject_id and
+    nothing else about it, so the labels and filters below need this join."""
+    courses = (_get("/courses", params={"active_only": False}) or {}).get("items", [])
+    subject_index = {}
+    for c in courses:
+        for sub in (_get(f"/courses/{c['id']}/subjects",
+                         params={"active_only": False}) or {}).get("items", []):
+            subject_index[sub["id"]] = sub
+    return subject_index, {c["id"]: c for c in courses}
 
 
 @st.cache_data(ttl=10)
@@ -224,17 +238,42 @@ with st.sidebar:
             f"{active_session.get('title') or active_session.get('subject') or 'session'}"
         )
 
+    # #4: course -> subject -> session. Keyed on subject_id, never classroom_id
+    # (one room hosts many subjects) — see the note above ui.filter_sessions.
+    subject_index, course_index = _catalogue(cache_user_id())
+    course_opts = {"All courses": None}
+    course_opts.update({f"{c['code']} — {c['name']}": c["id"]
+                        for c in course_index.values()})
+    course_pick = st.selectbox("Course", list(course_opts.keys()), key="sd_course")
+    sel_course_id = course_opts[course_pick]
+
+    subject_opts = {"All subjects": None}
+    subject_opts.update({
+        f"{sub['subject_code']}  {sub['subject_name']}": sub["id"]
+        for sub in subject_index.values()
+        if sel_course_id is None or sub.get("course_id") == sel_course_id
+    })
+    subject_pick = st.selectbox("Subject", list(subject_opts.keys()), key="sd_subject")
+    sel_subject_id = subject_opts[subject_pick]
+
     completed = [s for s in sessions if s.get("status") == "completed"]
+    completed = filter_sessions(completed, subject_index,
+                                course_id=sel_course_id, subject_id=sel_subject_id)
     if completed:
+        # #7: the date is part of the label. Sessions repeat titles week to week,
+        # so without it the picker offers rows that cannot be told apart.
         sess_map = {
-            f"{s.get('title') or s.get('subject', '?')}": s["id"]
+            f"{s.get('title') or s.get('subject', '?')}"
+            f" · {format_session_when(s.get('started_at'))}": s["id"]
             for s in completed
         }
         chosen_sess = st.selectbox("Session for analytics", list(sess_map.keys()))
         session_id  = sess_map[chosen_sess]
+        chosen_session = next(s for s in completed if s["id"] == session_id)
     else:
         session_id = None
-        st.info("No completed sessions yet.")
+        chosen_session = None
+        st.info("No completed sessions match this course/subject.")
 
     st.divider()
     if st.button("↺ Refresh", use_container_width=True):
@@ -345,6 +384,14 @@ with col_b:
     st.markdown('<p class="section-label">▸ Attention Timeline</p>', unsafe_allow_html=True)
 
     if session_id:
+        # #8: the chart plots ONE session. Unlabelled it reads as the student's
+        # attention in general, which is a different and much stronger claim.
+        if chosen_session is not None:
+            _tl = resolve_session_context([chosen_session], subject_index, course_index)
+            st.caption(
+                f"**{_tl['subject_label']}**  ·  course {_tl['course_label']}"
+                f"  ·  {format_session_when(chosen_session.get('started_at'))}"
+            )
         timeline = _timeline(cache_user_id(), session_id)
         if timeline:
             times_min  = [t["time_ms"] / 60_000 for t in timeline]
