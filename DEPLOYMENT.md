@@ -526,6 +526,11 @@ Then open <http://localhost:8501>, log in with the account created by
 The Radar Lab PC may have no internet. Build on a connected machine, then
 transfer.
 
+> This section moves the **images and models**. It does not move the roster —
+> students, face embeddings and history live in Postgres and are covered
+> separately in [§7a](#7a-moving-the-roster--students-embeddings-and-history).
+> A stack deployed without that step starts healthy and recognises nobody.
+
 **On the build machine:**
 
 ```bash
@@ -557,6 +562,114 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 
 Because the images are loaded rather than built, no `docker compose build` runs
 and nothing is pulled from the network.
+
+---
+
+## 7a. Moving the roster — students, embeddings and history
+
+§7 moves the *images and models*. It does not move the **roster**, and a stack
+brought up without one starts cleanly, reports `healthy`, and recognises nobody.
+`/health` shows `gallery_size: 0` and every face in the live feed is an unknown.
+
+### What actually has to move — less than it looks
+
+| Artifact | Size | Needed? | Why |
+|---|---|---|---|
+| **Postgres database** | small | **YES — this is the whole roster** | `students.face_embedding` is a real column. The embeddings live *in the database*, not in `data/` |
+| `data/embeddings_cache/` | 256 KB | Optional | The FAISS index — a **derived cache**, rebuilt automatically from Postgres |
+| `data/student_photos/` | 583 MB | Optional | Only serves `GET /students/{id}/photo` (the Admin panel thumbnail) and re-enrolment. Recognition never reads it |
+| `data/videos/` | 1.4 GB | **No** | Test clips |
+
+The FAISS index rebuilds itself. `backend/main.py` on startup:
+
+```python
+if settings.gallery_rebuild_on_startup or gallery.size == 0:
+    # rebuild from PostgreSQL
+```
+
+So a restored database with **no** `data/embeddings_cache` produces a correct
+gallery on the first backend boot, with no manual step. Copying the cache only
+saves that one rebuild. `data/` is a **bind mount**, not a named volume, so it
+does not travel with `docker save` either way.
+
+### Option 1 — transfer the database *(recommended: keeps history)*
+
+Carries the roster, the embeddings, past sessions, attendance and behaviour.
+
+**On the source machine:**
+
+```bash
+docker compose exec -T postgres pg_dump -U cm_user -d classroom_monitor \
+  --clean --if-exists > classroom_roster.sql
+```
+
+**On the target**, after §B.6 has created the database:
+
+```bash
+docker compose up -d postgres
+docker compose exec -T postgres psql -U cm_user -d classroom_monitor < classroom_roster.sql
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d backend
+docker compose logs backend | grep -i gallery      # expect "Rebuilding FAISS gallery"
+```
+
+`cm_user` and `classroom_monitor` are the compose defaults; if `.env` sets
+`POSTGRES_USER` or `POSTGRES_DB`, substitute those in both commands.
+
+Run `01_setup_db.py` **before** restoring, not after — it creates the schema the
+dump expects. Do not run `02_register_students.py` or `06_seed_student_logins.py`
+afterwards: the dump already contains those rows, and re-running them on top is
+how duplicate students appear.
+
+### Option 2 — re-enrol on site *(no history)*
+
+Only if the database cannot leave the source machine. Needs the enrolment videos
+or photos physically present on the target.
+
+```bash
+docker compose run --rm backend python scripts/02_register_students.py
+docker compose run --rm backend python scripts/06_seed_student_logins.py
+```
+
+This produces **new student ids**, so any attendance history from the old machine
+can never be reattached. It also re-runs face detection over every enrolment
+video, which is the slow part — budget minutes per student, on the GPU.
+
+> **Radar Lab note.** That PC holds enrolment videos for the whole Avionics
+> department. `02_register_students.py --video-dir` defaults to
+> `data/student_photos` and enrols *every* per-student folder it finds there, so
+> pointing it at the departmental directory enrols hundreds of students instead
+> of the 15-student 99B roster — and puts all of them into one FAISS gallery that
+> `best_match` then searches for every face. If the intent is the existing 99B
+> roster, use **Option 1** and do not run the enrolment scripts at all.
+
+### Verifying the roster landed
+
+Per §6.5, `gallery_size` in `/health` is the check:
+
+```bash
+curl -s localhost:8000/health | python3 -m json.tool
+```
+
+```json
+{ "status": "ok", "db": true, "gallery_size": 15, "gpu_available": true }
+```
+
+| `gallery_size` | Meaning |
+|---|---|
+| **15** | The 99B roster is loaded. Correct |
+| **0** | No embeddings reached the database. The dump did not restore, or restored into a different database than the backend is pointed at |
+| Some other number | You enrolled something other than the intended roster — check `02_register_students.py`'s source directory |
+
+Confirm the count independently, since `gallery_size` counts FAISS vectors rather
+than roster rows:
+
+```bash
+docker compose exec -T postgres psql -U cm_user -d classroom_monitor -c \
+  "SELECT count(*) AS students, count(face_embedding) AS with_embedding FROM students;"
+```
+
+Both numbers should equal the roster size. A student row with no embedding is
+enrolled on paper and invisible to recognition.
 
 ---
 
