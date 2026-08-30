@@ -170,7 +170,9 @@ if not courses:
 
 course_label = {f"{c['code']} — {c['name']}": c["id"] for c in courses}
 
-tab_subjects, tab_instructors = st.tabs(["📚  Subjects", "👤  Instructors"])
+tab_subjects, tab_instructors, tab_rollover = st.tabs(
+    ["📚  Subjects", "👤  Instructors", "🗑  Semester Rollover"]
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -505,3 +507,111 @@ with tab_instructors:
 
         if st.button("↺  Refresh", use_container_width=True):
             _refresh()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB 3 – Semester Rollover  (bulk session deletion)
+# ══════════════════════════════════════════════════════════════════════════════
+# The most destructive control in the application, and the reason it lives HERE
+# rather than beside the per-session delete on Live Monitor: clearing a course
+# at the end of a term is setup, which is this role's whole remit, and it spans
+# every instructor's subjects at once — which is precisely more than any one
+# instructor's scope. POST /courses/{id}/sessions/delete-all is gated to
+# TRAINING_CONTROL server-side for the same reason.
+with tab_rollover:
+    st.markdown(
+        '<p class="section-label">▸ Delete every session in a course</p>',
+        unsafe_allow_html=True,
+    )
+    st.error(
+        "**This is irreversible.** Deleting a course's sessions also deletes "
+        "every attendance record, behaviour event and face detection recorded "
+        "in them — for every student and every instructor involved. There is no "
+        "undo and no export. Take a database backup first."
+    )
+
+    roll_label = st.selectbox("Course", list(course_label.keys()), key="roll_course")
+    roll_course_id = course_label[roll_label]
+
+    roll_subjects = _subjects(cache_user_id(), roll_course_id)
+    subject_choices = {"— every subject in this course —": None}
+    subject_choices.update({
+        f"{s['subject_code']}  {s['subject_name']}"
+        + ("" if s["is_active"] else "  [archived]"): s["id"]
+        for s in roll_subjects
+    })
+    roll_subject_label = st.selectbox(
+        "Scope", list(subject_choices.keys()), key="roll_subject"
+    )
+    roll_subject_id = subject_choices[roll_subject_label]
+
+    # GET /sessions filters by classroom, not by course, and TRAINING_CONTROL
+    # is unscoped there (list_sessions narrows only INSTRUCTOR and STUDENT) —
+    # so it answers with every session in the department. The course scope is
+    # therefore applied here, against the subject ids this course actually
+    # owns, and the listing is paged to exhaustion rather than trusting one
+    # page: the endpoint caps limit at 200, and an under-count would understate
+    # what the button is about to destroy.
+    #
+    # The number shown is then sent back as expected_count, and the API refuses
+    # the delete if its own count disagrees. So a session started between this
+    # render and the button press fails the whole batch instead of being swept
+    # up in it, and this client-side scoping cannot silently widen the wipe —
+    # the server recomputes the set from the course id regardless.
+    wanted_subject_ids = (
+        {roll_subject_id} if roll_subject_id is not None
+        else {s["id"] for s in roll_subjects}
+    )
+    doomed, skip = [], 0
+    while True:
+        page = _get("/sessions", params={"skip": skip, "limit": 200}) or {}
+        items = page.get("items", [])
+        doomed += [s for s in items if s.get("subject_id") in wanted_subject_ids]
+        if len(items) < 200:
+            break
+        skip += 200
+    n = len(doomed)
+
+    if n == 0:
+        st.info("No sessions match this scope. Nothing to delete.")
+    else:
+        live = [s for s in doomed if (s.get("status") or "").lower() == "processing"]
+        st.metric("Sessions that will be deleted", n)
+        with st.expander(f"Show the {n} session(s) first", expanded=False):
+            st.table(pd.DataFrame([
+                {
+                    "Status": (s.get("status") or "—").upper(),
+                    "Title": s.get("title") or s.get("subject") or "—",
+                    "Started": (s.get("started_at") or "—")[:16].replace("T", " "),
+                }
+                for s in doomed
+            ]))
+
+        if live:
+            st.error(
+                f"{len(live)} of these is still PROCESSING. The whole batch is "
+                f"refused until it is stopped — a partial wipe is the outcome "
+                f"hardest to reason about afterwards."
+            )
+        else:
+            st.caption("Type **DELETE** to confirm.")
+            typed = st.text_input(
+                "Confirm", key="roll_confirm", label_visibility="collapsed"
+            )
+            if st.button(
+                f"🗑  Permanently delete {n} session(s)",
+                type="primary", use_container_width=True,
+                disabled=(typed.strip() != "DELETE"),
+            ):
+                body = {"confirm": "DELETE", "expected_count": n}
+                if roll_subject_id is not None:
+                    body["subject_id"] = roll_subject_id
+                result, error = _request(
+                    "POST", f"/courses/{roll_course_id}/sessions/delete-all",
+                    json=body,
+                )
+                if error:
+                    st.error(error)
+                else:
+                    st.success(f"Deleted {result['deleted']} session(s).")
+                    _refresh()

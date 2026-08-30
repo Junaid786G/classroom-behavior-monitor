@@ -30,7 +30,7 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_LIVE_MONITOR, require_page_access
-from ui import as_display as _as_display
+from ui import as_display as _as_display, session_delete_widget
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -99,6 +99,29 @@ def _post_checked(path: str, **kw) -> Tuple[Optional[dict], Optional[str]]:
     try:
         r = requests.post(f"{API_BASE}{path}", timeout=15,
                           headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
+        if r.ok:
+            return r.json(), None
+        try:
+            detail = r.json().get("detail")
+        except Exception:
+            detail = None
+        return None, str(detail or f"HTTP {r.status_code}")
+    except Exception as exc:
+        return None, f"Could not reach the backend: {exc}"
+
+
+def _delete_checked(path: str, **kw) -> Tuple[Optional[dict], Optional[str]]:
+    """DELETE returning (body, error_message), same contract as _post_checked.
+
+    A delete that fails silently is worse than a start that fails silently: the
+    operator is left unsure whether the data is gone. Every refusal this one
+    raises is worth reading — 409 "still processing", 404 "not one of your
+    assigned subjects" — so the detail is kept rather than collapsed to None.
+    """
+    try:
+        r = requests.delete(f"{API_BASE}{path}", timeout=30,
+                            headers=auth_headers(), **kw)
         bounce_if_unauthorized(r)
         if r.ok:
             return r.json(), None
@@ -656,6 +679,14 @@ if not st.session_state.session_id:
             ]),
             integer=("Frames",),
         ))
+
+        session_delete_widget(
+            my_sessions,
+            lambda sid: _delete_checked(f"/sessions/{sid}",
+                                        json={"confirm": "DELETE"}),
+            key_prefix="lm_del",
+            on_deleted=_list_sessions.clear,
+        )
 
         # Only COMPLETED sessions can be re-opened: for anything else the
         # monitor below falls through to the video upload form, which is

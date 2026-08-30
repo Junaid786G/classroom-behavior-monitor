@@ -26,9 +26,11 @@ from permissions import (
     PAGE_STUDENT_DASHBOARD,
     PAGE_STUDENT_PORTAL,
     PAGE_TRAINING_CONTROL,
+    ROLE_INSTRUCTOR,
     can_access,
     require_page_access,
 )
+from ui import session_delete_widget
 
 # ── Page config (must be first Streamlit call) ────────────────────────────────
 st.set_page_config(
@@ -69,6 +71,31 @@ render_sidebar_identity()
 role = require_page_access(PAGE_HOME)
 
 # ── API helpers ───────────────────────────────────────────────────────────────
+
+
+def _delete_checked(path: str, **kw):
+    """DELETE returning (body, error_message).
+
+    Home's other helpers collapse failures to None, which suits a dashboard
+    read. A refused delete has a reason the user needs — 409 "still
+    processing", 404 "not one of your subjects" — and silence would leave them
+    unsure whether the data is gone.
+    """
+    try:
+        r = requests.delete(f"{API_BASE}{path}", timeout=30,
+                            headers=auth_headers(), **kw)
+        bounce_if_unauthorized(r)
+        if r.ok:
+            return r.json(), None
+        try:
+            detail = r.json().get("detail")
+        except Exception:
+            detail = None
+        return None, str(detail or f"HTTP {r.status_code}")
+    except Exception as exc:
+        return None, f"Could not reach the backend: {exc}"
+
+
 @st.cache_data(ttl=5)
 def _health() -> dict:
     try:
@@ -161,6 +188,20 @@ with left:
         import pandas as pd
         df = pd.DataFrame(rows)
         st.table(df)
+
+        # Deleting from Home uses the SAME widget as Live Monitor rather than a
+        # second copy — see ui.session_delete_widget. INSTRUCTOR only: HOD is
+        # read-only oversight by models.py's definition of the role, and the
+        # API refuses them regardless. This list is already scoped server-side,
+        # so an instructor is only ever offered their own assigned subjects.
+        if role == ROLE_INSTRUCTOR:
+            session_delete_widget(
+                sessions,
+                lambda sid: _delete_checked(f"/sessions/{sid}",
+                                            json={"confirm": "DELETE"}),
+                key_prefix="home_del",
+                on_deleted=_recent_sessions.clear,
+            )
     else:
         st.info("No sessions yet — upload a video on the **Live Monitor** page to begin.")
 

@@ -35,6 +35,8 @@ from backend.deps import (
     authenticate_ws,
     get_current_user,
     require_instructor,
+    require_session_access,
+    require_training_control,
 )
 from backend.models import (
     AlertSeverity,
@@ -59,6 +61,9 @@ from backend.pipeline.live_worker import (
     validate_stream_url,
 )
 from backend.schemas import (
+    BulkSessionDeleteRequest,
+    SessionDeleteRequest,
+    SessionDeleteResponse,
     LiveStartRequest,
     LiveStatusOut,
     Page,
@@ -131,6 +136,142 @@ async def list_sessions(
         limit=limit,
     )
     return Page(total=total, skip=skip, limit=limit, items=[SessionOut.model_validate(r) for r in rows])
+
+
+# ── Deletion ──────────────────────────────────────────────────────────────────
+# HOD IS ABSENT FROM BOTH ROUTES, AND THAT IS THE POINT. models.py defines the
+# role as "read-only oversight", and permissions.py already draws this exact
+# line for a far smaller power: ATTENDANCE_WRITERS excludes HOD so that page
+# access alone cannot hand them the Manual Override. A button that destroys up
+# to 168,000 rows contradicts "read-only" considerably harder than that did.
+#
+# The split between the two routes is by JOB, not by seniority:
+#   * one session is a bad recording, which is the instructor's own to remove,
+#     scoped by require_session_access to the subjects they are assigned;
+#   * a whole course is semester rollover, which is setup — TRAINING_CONTROL's
+#     entire remit — and by definition exceeds any one instructor's scope.
+
+#: Statuses that must never be deleted. SessionStatus has no RUNNING: the live
+#: pipeline marks a session PROCESSING, so that is the one to refuse. PENDING is
+#: deletable — it was created and never started, which is exactly the row most
+#: worth clearing up.
+_UNDELETABLE = frozenset({SessionStatus.PROCESSING})
+
+
+async def _refuse_if_live(session_id: UUID, session) -> None:
+    """Refuse a session that is being written to right now.
+
+    TWO checks, because either can be true without the other. The stored status
+    is the durable answer, but a worker that died without updating its row
+    leaves a session reading COMPLETED while the registry still holds it; and a
+    row can read PROCESSING months after the process that set it has gone (there
+    is one such session in this database, stuck since 2026-07-13). Deleting a
+    session under a running worker means the worker's next insert violates a
+    foreign key that no longer has a parent.
+    """
+    if session.status in _UNDELETABLE:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Session is {session.status.value} and cannot be deleted. Stop it "
+            f"first — a session still being written to would take its own new "
+            f"rows down with it.",
+        )
+    worker = get_worker(session_id)
+    if worker is not None and worker.is_running:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "A live worker is still running for this session. Stop the live "
+            "feed before deleting it.",
+        )
+
+
+@router.delete(
+    "/sessions/{session_id}",
+    response_model=SessionDeleteResponse,
+    dependencies=[Depends(require_instructor), Depends(require_session_access)],
+)
+async def delete_session(
+    session_id: UUID,
+    payload: SessionDeleteRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete one session and everything recorded against it. IRREVERSIBLE.
+
+    The two dependencies are ordered deliberately: require_instructor runs
+    first, so a HOD is refused as a role before require_session_access — which
+    returns early for HOD — would have waved them through.
+
+    The cascade is Postgres's, not the ORM's (see crud.delete_session). It
+    reaches further than this router: attendance_records go with the session,
+    and crud.get_student_overview builds the student portal's Session History
+    and By Subject FROM attendance_records, so the deleted session leaves every
+    affected student's own view at the same time. That is verified end to end in
+    backend/tests/test_session_deletion.py rather than assumed from the schema.
+    """
+    session = await crud.get_session(db, session_id)
+    if session is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
+
+    await _refuse_if_live(session_id, session)
+
+    deleted = await crud.delete_session(db, session_id)
+    if not deleted:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
+    logger.warning(
+        "session %s deleted (subject=%s status=%s)",
+        session_id, session.subject_id, session.status.value,
+    )
+    return SessionDeleteResponse(deleted=deleted, session_ids=[session_id])
+
+
+@router.post(
+    "/courses/{course_id}/sessions/delete-all",
+    response_model=SessionDeleteResponse,
+    dependencies=[Depends(require_training_control)],
+)
+async def delete_course_sessions(
+    course_id: int,
+    payload: BulkSessionDeleteRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete EVERY session of one course, or of one subject within it.
+
+    Semester rollover. POST rather than DELETE because it carries a body that
+    every client must send, and because it names an action rather than a
+    resource.
+
+    THREE guards, none of them redundant:
+      * `confirm` must be the literal "DELETE" — see BulkSessionDeleteRequest;
+      * `expected_count` must equal what is actually about to go, so a rollover
+        that races a session created seconds earlier fails instead of silently
+        taking one more than the operator was shown;
+      * no matched session may be live, checked per session by _refuse_if_live.
+        One PROCESSING session blocks the whole batch rather than being skipped:
+        a partial wipe is the outcome hardest to reason about afterwards.
+    """
+    if await crud.get_course(db, course_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Course {course_id} not found")
+
+    sessions = await crud.list_course_sessions(db, course_id, payload.subject_id)
+
+    if len(sessions) != payload.expected_count:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Expected to delete {payload.expected_count} session(s) but found "
+            f"{len(sessions)}. Refresh and try again — the set changed since it "
+            f"was shown to you.",
+        )
+
+    for session in sessions:
+        await _refuse_if_live(session.id, session)
+
+    ids = [s.id for s in sessions]
+    deleted = await crud.delete_course_sessions(db, course_id, payload.subject_id)
+    logger.warning(
+        "BULK DELETE course=%s subject=%s removed %d sessions",
+        course_id, payload.subject_id, deleted,
+    )
+    return SessionDeleteResponse(deleted=deleted, session_ids=ids)
 
 
 @router.get(

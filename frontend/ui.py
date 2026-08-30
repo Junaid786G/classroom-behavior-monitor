@@ -6,9 +6,10 @@ bootstrap), so `from ui import ...` resolves from pages/ the same way
 """
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Callable, Iterable, Optional, Sequence
 
 import pandas as pd
+import streamlit as st
 
 # WHY THE TABLES ON THIS SITE ARE st.table AND NOT st.dataframe
 # -------------------------------------------------------------
@@ -60,3 +61,81 @@ def as_display(
                 lambda v: blank if pd.isna(v) else f"{int(v):,}"
             )
     return out
+
+
+def session_delete_widget(
+    sessions: Sequence[dict],
+    delete_fn: Callable[[str], tuple[Optional[dict], Optional[str]]],
+    *,
+    key_prefix: str,
+    on_deleted: Optional[Callable[[], None]] = None,
+) -> None:
+    """The 'delete one session' control, shared by Home and Live Monitor.
+
+    ONE implementation on purpose. This is the most destructive control in the
+    app — it removes a session's attendance, behaviour events and face
+    detections for everyone, including the students' own records — and two
+    copies of it would be two places for the confirmation to drift out of step.
+
+    The typed confirmation is the session's own TITLE, not a generic word. The
+    realistic mistake here is deleting the WRONG session from a list of similar
+    ones, and only the title distinguishes them; "DELETE" would be typed just as
+    readily against the wrong row. The API additionally requires its own literal
+    confirmation in the body, so neither side stands alone.
+
+    delete_fn is injected rather than imported: each page already owns an HTTP
+    helper with its own timeout and error handling, and this widget has no
+    business picking one.
+    """
+    if not sessions:
+        return
+
+    with st.expander("🗑  Delete a session", expanded=False):
+        st.warning(
+            "Deleting a session also deletes its attendance, behaviour events "
+            "and face detections — permanently, and for everyone. The students "
+            "recorded in it lose that session from their own records too. This "
+            "cannot be undone."
+        )
+        options = {
+            f"{s.get('title') or s.get('subject') or '—'}  ·  "
+            f"{(s.get('started_at') or '—')[:16].replace('T', ' ')}": s
+            for s in sessions
+        }
+        label = st.selectbox(
+            "Session", list(options.keys()), index=None,
+            placeholder="Select a session", key=f"{key_prefix}_pick",
+        )
+        if not label:
+            return
+
+        target = options[label]
+        # Mirrors the API's own refusal so the user is told before they type a
+        # title out; the server refuses it regardless.
+        if (target.get("status") or "").lower() == "processing":
+            st.error(
+                "This session is still processing. Stop the live feed before "
+                "deleting it."
+            )
+            return
+
+        expected = target.get("title") or target.get("subject") or "—"
+        st.caption(f"Type the session title to confirm: **{expected}**")
+        typed = st.text_input(
+            "Confirm title", key=f"{key_prefix}_confirm",
+            label_visibility="collapsed",
+        )
+        if st.button(
+            "🗑  Delete this session permanently",
+            type="primary", use_container_width=True,
+            key=f"{key_prefix}_go",
+            disabled=(typed.strip() != expected),
+        ):
+            _, error = delete_fn(str(target["id"]))
+            if error:
+                st.error(error)
+            else:
+                st.success(f"Deleted “{expected}”.")
+                if on_deleted:
+                    on_deleted()
+                st.rerun()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -597,6 +597,40 @@ class HealthResponse(BaseModel):
 # Applies to passwords a user chooses, not to the seeded ones: 03_migrate and
 # the 05/06 scripts write hashes directly and never come through here.
 MIN_PASSWORD_LENGTH = 8
+
+
+class SessionDeleteRequest(BaseModel):
+    """Confirmation body for deleting ONE session.
+
+    The UI also makes the user type the session's title, which is the specific
+    check; this is the server-side one. A destructive route that fires on the
+    URL alone is one mis-click or one stray curl away from data loss, so the
+    literal has to be in the body whatever the caller is.
+    """
+    confirm: Literal["DELETE"]
+
+
+class BulkSessionDeleteRequest(BaseModel):
+    """Confirmation body for deleting EVERY session of a course.
+
+    expected_count is the guard that matters. The caller states how many
+    sessions it believes it is destroying, and the route refuses if reality
+    disagrees — so a rollover that races a session started seconds earlier
+    fails loudly instead of taking the extra one with it.
+
+    subject_id narrows the wipe to a single subject within the course. Absent,
+    the whole course goes.
+    """
+    confirm: Literal["DELETE"]
+    expected_count: int = Field(..., ge=0)
+    subject_id: Optional[int] = None
+
+
+class SessionDeleteResponse(BaseModel):
+    """What was actually destroyed. deleted counts SESSIONS, not child rows —
+    the cascade happens inside Postgres and is not reported back per table."""
+    deleted: int
+    session_ids: List[UUID] = []
 
 
 class LoginRequest(BaseModel):

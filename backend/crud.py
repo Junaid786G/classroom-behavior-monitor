@@ -426,6 +426,61 @@ async def list_instructor_assignments(db: AsyncSession, user_id: int) -> List[di
     return [dict(r._mapping) for r in rows]
 
 
+async def list_course_sessions(
+    db: AsyncSession, course_id: int, subject_id: Optional[int] = None
+) -> List[Session]:
+    """Every session belonging to one course, optionally narrowed to a subject.
+
+    Sessions carry subject_id, not course_id, so the course link is one join
+    away. Returned in full rather than counted, because the caller has to
+    inspect each status before deleting anything.
+    """
+    q = (
+        select(Session)
+        .join(Subject, Subject.id == Session.subject_id)
+        .where(Subject.course_id == course_id)
+    )
+    if subject_id is not None:
+        q = q.where(Session.subject_id == subject_id)
+    return list((await db.execute(q.order_by(Session.created_at))).scalars().all())
+
+
+async def delete_session(db: AsyncSession, session_id: UUID) -> int:
+    """Delete one session and everything hanging off it. Returns rows deleted.
+
+    A CORE delete, deliberately, and NOT `db.delete(obj)`. Session's
+    relationships (attendance_records, behavior_events, face_detections, alerts,
+    video_uploads) are declared without `cascade=` or `passive_deletes=True`, so
+    the ORM path would load every child into memory and then try to NULL their
+    session_id — a column that is NOT NULL on all of them. On the worst session
+    in this database that is 83,968 behavior_events plus 83,968 face_detections
+    read into the process before it fails.
+
+    Issuing the DELETE at Core level hands the work to Postgres, where all six
+    child tables carry a real ON DELETE CASCADE (verified against
+    information_schema, not just against the model definitions). Same shape as
+    delete_student and delete_classroom above.
+    """
+    r = await db.execute(delete(Session).where(Session.id == session_id))
+    return r.rowcount
+
+
+async def delete_course_sessions(
+    db: AsyncSession, course_id: int, subject_id: Optional[int] = None
+) -> int:
+    """Delete every session of one course (optionally one subject). Rows deleted.
+
+    Core delete for the same reason as delete_session. The subject filter is a
+    subquery rather than a join, because DELETE ... USING is not portable and
+    the id list here is small (one course's subjects).
+    """
+    subjects = select(Subject.id).where(Subject.course_id == course_id)
+    if subject_id is not None:
+        subjects = subjects.where(Subject.id == subject_id)
+    r = await db.execute(delete(Session).where(Session.subject_id.in_(subjects)))
+    return r.rowcount
+
+
 async def start_session(db: AsyncSession, session_id: UUID) -> Optional[Session]:
     await db.execute(
         update(Session)
