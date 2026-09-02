@@ -832,7 +832,11 @@ with video_col:
     if st.session_state.latest_frame_b64:
         st.image(
             base64.b64decode(st.session_state.latest_frame_b64),
-            use_container_width=True,
+            # use_column_width, NOT use_container_width: requirements.txt pins
+            # streamlit==1.35.0, where st.image has no use_container_width and
+            # passing it is a TypeError mid-render. 1.35 and current streamlit
+            # both accept use_column_width, so this form is portable.
+            use_column_width=True,
             caption="Annotated — RetinaFace + ArcFace + ByteTrack",
         )
     else:
@@ -877,8 +881,13 @@ with stats_col:
             color = _BEHAVIOR_COLOR.get(behavior, "#3d5a6b")
             conf   = det.get("rec_confidence")
             conf_s = f" {conf:.0%}" if conf else ""
+            # Lifted out of the f-string on purpose. Reusing the OUTER quote
+            # character inside a replacement field only parses on Python 3.12+
+            # (PEP 701); the frontend image runs 3.11, where it is a SyntaxError
+            # that takes the whole page down at import time.
+            unknown_cls = "unknown" if not det.get("student_id") else ""
             st.markdown(
-                f'<div class="detection-item {'unknown' if not det.get('student_id') else ''}">'
+                f'<div class="detection-item {unknown_cls}">'
                 f'<b style="color:{color}">{name}</b>{conf_s}<br>'
                 f'<span style="color:#3d5a6b;font-size:0.75rem">'
                 f'T{det["track_id"]}  ·  {behavior}'
