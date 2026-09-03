@@ -1,0 +1,73 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  Local development overlay — live source, no rebuilds.
+#
+#  Use alongside the base file. It never replaces it:
+#
+#    docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+#                   up -d --no-deps backend frontend
+#
+#  With the GPU backend, put the gpu overlay first (later files win):
+#
+#    docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
+#                   -f docker-compose.dev.yml up -d --no-deps backend frontend
+#
+#  WHY THIS IS NOT NAMED docker-compose.override.yml
+#  A file with that name is loaded AUTOMATICALLY by every bare `docker compose`
+#  command. Live-mounted source would then silently become the default for the
+#  demo as well — the opposite of what this file is for. Named like this, it
+#  applies only when you ask for it by -f, exactly like docker-compose.gpu.yml.
+#
+#  To return to the shipped configuration, leave this file out of the -f list
+#  and recreate the containers. Nothing here is baked into an image.
+# ════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── Backend: live source, MANUAL restart ────────────────────────────────
+  #
+  # Compose MERGES volumes by target path, so the base file's ./data, ./logs,
+  # ./models and the insightface_cache volume all survive; this only adds one.
+  # (`command:` behaves the opposite way — see the frontend note below.)
+  backend:
+    volumes:
+      - ./backend:/app/backend
+
+    # Deliberately NO --reload, and no `command:` override at all, so the base
+    # file's command stands unchanged. uvicorn --reload restarts the worker on
+    # every save, which tears down any live WebSocket session and wipes the
+    # BehaviorAnalyzer's per-track state mid-capture — the exact class of bug
+    # the reset_all() fix exists to prevent. Edits therefore need:
+    #
+    #     docker restart cm_backend        (~40s, InsightFace model load)
+    #
+    # or the "Restart Backend (clean state)" desktop icon, which does that and
+    # then prints /health.
+
+  # ── Frontend: live source, automatic reload ─────────────────────────────
+  frontend:
+    volumes:
+      - ./frontend:/app/frontend
+      # The pinned theme lives in /app/.streamlit/config.toml, OUTSIDE the
+      # mount above, so theme edits still need a rebuild. Uncomment to make
+      # those live too — but note that file is the fix for the dark-mode
+      # st.dataframe bug, so it is not something to edit casually.
+      # - ./.streamlit:/app/.streamlit
+
+    # `command:` REPLACES the base file's wholesale — it does not merge — so
+    # every flag has to be repeated here. Dropping --server.maxUploadSize=3072
+    # would silently put the upload limit back to Streamlit's 200 MB default,
+    # and the 237 MB test clip would stop uploading for no visible reason.
+    #
+    # The only change from the base command is fileWatcherType: none -> auto.
+    # watchdog 6.0.0 is already in the image and inotify propagates through a
+    # bind mount on native Linux, so a save reruns the app with no restart.
+    # It stays "none" in the base file because in a real session any stray file
+    # change would rerun the script for every viewer.
+    command: >
+      streamlit run frontend/app.py
+        --server.port=8501
+        --server.address=0.0.0.0
+        --server.headless=true
+        --server.fileWatcherType=auto
+        --server.maxUploadSize=3072
+        --browser.gatherUsageStats=false
