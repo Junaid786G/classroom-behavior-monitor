@@ -1,0 +1,159 @@
+===============================================================================
+ CLASSROOM CCTV MONITOR - EVALUATION CHEAT SHEET
+ Last verified: 2026-09-03. Every command below was run and its output checked.
+===============================================================================
+
+
+-------------------------------------------------------------------------------
+ 1. CONNECT TO THE DATABASE
+-------------------------------------------------------------------------------
+
+docker exec -it cm_postgres psql -U cm_user -d classroom_monitor
+
+  You should see a "classroom_monitor=#" prompt.
+  Note: cm_postgres is the live database. There is a second container called
+  classroom_pg holding an old copy - do not use it.
+
+
+-------------------------------------------------------------------------------
+ 2. READ-ONLY QUERIES TO SHOW REAL DATA
+-------------------------------------------------------------------------------
+ All are SELECT only. None of them change anything.
+ Copy one line at a time. Each must end with a semicolon.
+
+
+-- Show every user account and which role it has (4 roles, 18 accounts)
+
+SELECT username, role, is_active FROM users ORDER BY role, username;
+
+
+-- Show the most recent recording sessions, newest first
+
+SELECT title, subject, status, total_frames_processed, created_at::date
+FROM sessions ORDER BY created_at DESC LIMIT 10;
+
+
+-- Count every behaviour event ever recorded, grouped by category
+
+SELECT behavior_type, count(*) AS events
+FROM behavior_events GROUP BY behavior_type ORDER BY events DESC;
+
+
+-- Show the enrolled student roster (15 students)
+
+SELECT student_code, full_name, is_active FROM students ORDER BY student_code;
+
+
+-- Attendance for ONE verified session (the 8-minute test clip)
+-- Expect: 14 PRESENT, 1 ABSENT (samaira - see note at the bottom)
+
+SELECT s.student_code, s.full_name, a.status, a.confirmed_frame_count
+FROM attendance_records a JOIN students s ON s.id = a.student_id
+WHERE a.session_id = 'f005bbf9-e33b-4e57-acec-b7321347eceb'
+ORDER BY s.student_code;
+
+
+-- THE KEY ONE: behaviour breakdown for that same session.
+-- This is the live evidence behind the numbers being quoted.
+-- Expect: ATTENTIVE 6043, UNKNOWN 449, SLEEPING 177, DISTRACTED 40
+
+SELECT behavior_type, count(*) AS events
+FROM behavior_events
+WHERE session_id = 'f005bbf9-e33b-4e57-acec-b7321347eceb'
+GROUP BY behavior_type ORDER BY events DESC;
+
+
+  The two certified sessions on the 8-minute clip:
+    f005bbf9-e33b-4e57-acec-b7321347eceb   sleeping 177, distracted 40
+    841a2e0d-1057-49fc-a858-f3c594f676b0   sleeping 177, distracted 36
+  Swap the id in either query above to show the second run.
+  Two runs of the same clip differ by 1-2 percent; that is normal variance.
+
+
+-------------------------------------------------------------------------------
+ 3. EXIT THE DATABASE PROMPT
+-------------------------------------------------------------------------------
+
+\q
+
+  (backslash q, then Enter. No semicolon.)
+  If a query is half-typed and the prompt looks stuck, press Ctrl-C first.
+
+
+-------------------------------------------------------------------------------
+ 4. FILE PATHS WORTH KNOWING
+-------------------------------------------------------------------------------
+
+backend/config.py
+    All tunable settings and their defaults - recognition threshold,
+    attendance threshold, and the behaviour/EAR/yaw/pitch values.
+
+backend/pipeline/behavior.py
+    The classification logic itself: how a face becomes ATTENTIVE,
+    DISTRACTED, SLEEPING or UNKNOWN. The sleeping and extreme-yaw fixes
+    live here.
+
+backend/models.py
+    The database structure - every table and column, in one file.
+
+backend/routers/stream.py
+    The live WebSocket pipeline: receives frames, runs recognition and
+    behaviour analysis, writes the rows the queries above read.
+
+frontend/permissions.py
+    Which of the 9 pages each of the 4 roles is allowed to open.
+
+docker-compose.yml
+    How the 5 containers are wired together, and the environment
+    settings passed to the backend.
+
+  Where a threshold actually comes from, in priority order:
+    1. docker-compose.yml backend "environment:" block  (highest)
+    2. /app/.env inside the container - this is .env.example, copied in
+       by the Dockerfile
+    3. the default in backend/config.py
+  The .env file in the project folder is NOT read by the containers.
+
+
+-------------------------------------------------------------------------------
+ 5. SEARCH FOR TEXT IN THE FRONTEND
+-------------------------------------------------------------------------------
+
+grep -rn "text" frontend/
+
+  -r searches every file in the folder, -n shows line numbers.
+  Run it from the project folder: ~/classroom_monitor
+
+  Example - find where the home page Quick Actions section is built:
+
+    grep -rn "Quick Actions" frontend/
+
+    frontend/app.py:207:    st.markdown('<p class="section-label">...
+
+  Example - find the role selector on the login screen:
+
+    grep -rn "Sign in as" frontend/
+
+    frontend/auth.py:471:                "Sign in as",
+
+  Same trick works on the backend:  grep -rn "SLEEPING" backend/
+
+
+-------------------------------------------------------------------------------
+ 6. TWO HONEST ANSWERS, IF ASKED
+-------------------------------------------------------------------------------
+
+Why is samaira always ABSENT?
+    Her enrolled face embedding is too weak to match. Measured over 60
+    frames she peaks at 0.246 similarity and is never the best candidate
+    for any face in the clip, so no threshold setting recovers her. She
+    needs re-enrolling from better footage. It is a known, recorded
+    limitation, not a crash or a silent failure.
+
+Can two instructors record at the same time?
+    Not safely yet. Two concurrent sessions exhaust the database
+    connection pool and silently drop frames. Single-session use, which
+    is how every figure here was measured, is unaffected. It is written
+    up in README.md under "Known limitations" as the top item to fix.
+
+===============================================================================
