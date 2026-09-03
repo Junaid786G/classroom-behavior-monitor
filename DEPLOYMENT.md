@@ -76,6 +76,35 @@ The GPU image is built on `nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04` with
 `onnxruntime-gpu==1.18.1`. The host driver only needs to be **newer** than the
 container's CUDA runtime — a CUDA 13 driver runs a CUDA 12.2 container fine.
 
+> ### ⚠ VERIFY THIS FIRST, BEFORE ANYTHING ELSE ON A NEW MACHINE
+>
+> **`cm_backend:gpu` does not fall back to CPU. Without GPU access it crashes.**
+>
+> Measured 2026-09-03: the GPU image started without `--gpus` loads Python and
+> imports the whole pipeline fine, then **segfaults (exit 139) the moment the
+> detector touches its model**. There is no error message and no CPU fallback —
+> the container simply dies. Isolated against a control: the crash happens with
+> and without a network, and does *not* happen when the GPU is present, so it is
+> GPU access alone.
+>
+> This contradicts the "silently ignores … and quietly fall back to CPU
+> inference" wording in the Compose-v1 warning above. That is true of the
+> *config* being dropped, but the practical result for **this** image is a crash,
+> not slow inference. Treat `gpu_available: false` as a hard stop.
+>
+> One command settles it, before you deploy anything else:
+>
+> ```bash
+> docker run --rm --gpus all nvidia/cuda:12.2.2-base-ubuntu22.04 nvidia-smi
+> ```
+>
+> If that does not print your GPU, **stop** and fix the driver /
+> `nvidia-container-toolkit` first. Nothing downstream will work.
+>
+> If the target machine genuinely has no GPU, deploy the CPU image
+> (`cm_backend:latest`, built from `Dockerfile.backend`) instead — that one is
+> built against CPU `onnxruntime` and runs correctly without a GPU.
+
 ---
 
 ## 3. Model files — do this before the first build
@@ -761,6 +790,7 @@ derived clock drifts from reality and silently rescales every threshold.
 | `gpu_available: false` under the GPU overlay | Compose v1 dropped the `deploy` block | Use `docker compose` (v2, space), not `docker-compose` |
 | Same, with v2 | `nvidia-container-toolkit` missing/unconfigured | Re-run §A.3, then `sudo systemctl restart docker` |
 | Same, on Windows | WSL1, or a driver installed inside WSL | `wsl -l -v` must show 2; never install a Linux NVIDIA driver in the distro |
+| Backend container exits immediately with code **139**, no error logged | `cm_backend:gpu` running without GPU access — it segfaults rather than falling back to CPU | Verify `docker run --rm --gpus all nvidia/cuda:12.2.2-base-ubuntu22.04 nvidia-smi` works; if the machine has no GPU, deploy `cm_backend:latest` (the CPU image) instead |
 | `Error response from daemon: could not select device driver "nvidia"` | Toolkit not registered with Docker | `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` |
 | `bind: address already in use` on 5432 | Another Postgres already holds the port — on the dev machine a container named `classroom_pg` does | `docker stop classroom_pg`, or set `POSTGRES_PORT=5433` in `.env` |
 | Behaviour analysis throws on the first frame; startup was clean | Models missing (§3 skipped) | `docker compose exec backend python scripts/00_fetch_models.py --check` |

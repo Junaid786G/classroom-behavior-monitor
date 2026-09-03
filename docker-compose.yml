@@ -127,6 +127,12 @@ services:
       # baseline ran on the HOST at 0.35 — 0.45 was never in force for it.
       # uzair peaks at 0.433, so 0.45 dropped him from 444 matches to 0.
       FACE_RECOGNITION_THRESHOLD: ${FACE_RECOGNITION_THRESHOLD:-0.35}
+      # albumentations phones PyPI on import to compare versions. Offline it
+      # fails in ~0.4s with a UserWarning and carries on - harmless, but it is
+      # the only outbound call the backend makes, and the warning looks alarming
+      # in a log. Nothing in this project uses albumentations directly; it
+      # arrives as a transitive dependency.
+      NO_ALBUMENTATIONS_UPDATE: "1"
       CORS_ORIGINS:            '["http://localhost:8501","http://frontend:8501"]'
     volumes:
       - ./data:/app/data
