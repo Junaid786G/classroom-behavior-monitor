@@ -796,6 +796,15 @@ async def live_stream(
             await crud.increment_frame_count(db, session_id, by=msg_index)
             await crud.end_session(db, session_id)
         recognizer.reset()
+        # Same pairing as live_worker.py, which has always reset both; this path
+        # reset only the recognizer. The analyzer's per-track dicts are keyed by
+        # track_id and ByteTracker restarts ids at 1 every session, so without
+        # this the next session's track 3 inherits this one's EAR baseline and
+        # dwell timers - see reset_all's own docstring, which documents the leak.
+        # No magnitude is quoted here on purpose: the run that first exposed it
+        # overlapped a second concurrent session and lost rows to connection-pool
+        # exhaustion, so that measurement cannot separate the two causes.
+        behavior_analyzer.reset_all()
 
 
 # ── Background video processor ────────────────────────────────────────────────

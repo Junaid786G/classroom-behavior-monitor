@@ -114,6 +114,19 @@ services:
       MODELS_PATH:             /app/models
       INSIGHTFACE_MODEL_NAME:  ${INSIGHTFACE_MODEL_NAME:-buffalo_l}
       GALLERY_REBUILD_ON_STARTUP: ${GALLERY_REBUILD_ON_STARTUP:-false}
+      # config.py defaults this to 0.70, which on real footage sits at the very
+      # top of the observed recognition range (max 0.743 on the 8-min clip) and
+      # marked 14 of 15 students ABSENT. .env has carried 0.35 all along; it
+      # never reached the container because no service reads .env as app config.
+      # 0.35 sits below FACE_RECOGNITION_THRESHOLD, so identity is decided by
+      # the recognition gate and ATTENDANCE_MIN_FRAMES does the rest.
+      ATTENDANCE_CONFIDENCE_THRESHOLD: ${ATTENDANCE_CONFIDENCE_THRESHOLD:-0.35}
+      # Same root cause as the line above: the image ships .env.example as
+      # /app/.env (Dockerfile.backend.gpu:108) and config.py reads it, so the
+      # container has always run 0.45 while the real .env said 0.35. The Aug 29
+      # baseline ran on the HOST at 0.35 — 0.45 was never in force for it.
+      # uzair peaks at 0.433, so 0.45 dropped him from 444 matches to 0.
+      FACE_RECOGNITION_THRESHOLD: ${FACE_RECOGNITION_THRESHOLD:-0.35}
       CORS_ORIGINS:            '["http://localhost:8501","http://frontend:8501"]'
     volumes:
       - ./data:/app/data
@@ -217,6 +230,7 @@ services:
         --server.address=0.0.0.0
         --server.headless=true
         --server.fileWatcherType=none
+        --server.maxUploadSize=3072
         --browser.gatherUsageStats=false
     environment:
       API_BASE_URL: http://backend:8000/api/v1
