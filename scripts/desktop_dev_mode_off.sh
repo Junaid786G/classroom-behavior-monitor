@@ -15,7 +15,11 @@
 #  never names a volume or a database container.
 # ─────────────────────────────────────────────────────────────────────────────
 
-PROJECT_DIR="/home/muhammadjunaidmalik/classroom_monitor"
+# Derive the project directory from this script's OWN location, so a clone at
+# any path under any username works. readlink -f resolves symlinks, so a
+# symlinked launcher still lands on the real scripts/ directory.
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
+PROJECT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 BOLD=$'\e[1m'; RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYA=$'\e[36m'
 INV=$'\e[7m'; RS=$'\e[0m'
 
@@ -34,7 +38,16 @@ echo "${BOLD}  Classroom CCTV Monitor — returning to CERTIFIED BASELINE${RS}"
 hr
 
 cd "$PROJECT_DIR" 2>/dev/null || {
-    echo "${RED}✗ Cannot enter $PROJECT_DIR${RS}"; pause_and_exit 1; }
+    echo "${RED}✗ Cannot enter $PROJECT_DIR${RS}"
+    echo "  (derived from this script at $SCRIPT_DIR)"; pause_and_exit 1; }
+
+# A derived path is only as good as what it points at. Fail loudly here rather
+# than letting `docker compose` fail with a confusing error further down.
+if [ ! -f "$PROJECT_DIR/docker-compose.yml" ]; then
+    echo "${RED}✗ $PROJECT_DIR does not look like the project${RS}"
+    echo "  (no docker-compose.yml; this script must stay in the repo's scripts/ dir)"
+    pause_and_exit 1
+fi
 
 if ! docker info >/dev/null 2>&1; then
     echo "${RED}✗ Docker is not running (or this user cannot reach it).${RS}"
