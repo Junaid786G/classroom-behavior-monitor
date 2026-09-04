@@ -68,13 +68,21 @@ The overlay never replaces the base; always pass both `-f` flags in that order.
 
 | Requirement | Minimum |
 |---|---|
-| NVIDIA driver | 535 (Linux) / 550 (Windows) |
+| NVIDIA driver | 550 (Linux and Windows) |
 | `nvidia-container-toolkit` | 1.14 (Linux only — Docker Desktop bundles it on Windows) |
 | GPU | Any CUDA compute capability ≥ 6.1, ≥ 6 GB VRAM |
 
-The GPU image is built on `nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04` with
+The GPU image is built on `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04` with
 `onnxruntime-gpu==1.18.1`. The host driver only needs to be **newer** than the
-container's CUDA runtime — a CUDA 13 driver runs a CUDA 12.2 container fine.
+container's CUDA runtime — a CUDA 13 driver runs a CUDA 12.4 container fine.
+
+> **The cuDNN MAJOR version is load-bearing — do not "simplify" the base tag.**
+> `onnxruntime-gpu` 1.18.1 links `libcudnn.so.9`. On a `cudnn8` base it installs
+> and imports without complaint, then fails to open the CUDA provider at
+> **runtime** and silently runs every model on CPU. That is exactly how a
+> mismatch shipped unnoticed on 2026-09-02, with `/health` reporting
+> `gpu_available: true` the whole time. `Dockerfile.backend.gpu` now fails the
+> build if the provider's shared libraries do not resolve.
 
 > ### ⚠ VERIFY THIS FIRST, BEFORE ANYTHING ELSE ON A NEW MACHINE
 >
@@ -95,7 +103,7 @@ container's CUDA runtime — a CUDA 13 driver runs a CUDA 12.2 container fine.
 > One command settles it, before you deploy anything else:
 >
 > ```bash
-> docker run --rm --gpus all nvidia/cuda:12.2.2-base-ubuntu22.04 nvidia-smi
+> docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 > ```
 >
 > If that does not print your GPU, **stop** and fix the driver /
@@ -234,7 +242,7 @@ sudo systemctl restart docker
 Confirm the toolkit works *before* touching the app:
 
 ```bash
-docker run --rm --gpus all nvidia/cuda:12.2.2-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 ```
 
 You should see your GPU's table. If this fails, nothing below will have GPU
@@ -362,7 +370,7 @@ From the Ubuntu WSL shell:
 nvidia-smi                      # the WSL shim; should list your GPU
 docker compose version          # expect v2.x — Desktop bundles it
 
-docker run --rm --gpus all nvidia/cuda:12.2.2-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 ```
 
 All three must succeed. If the third fails, stop and fix Docker Desktop's WSL
@@ -790,7 +798,7 @@ derived clock drifts from reality and silently rescales every threshold.
 | `gpu_available: false` under the GPU overlay | Compose v1 dropped the `deploy` block | Use `docker compose` (v2, space), not `docker-compose` |
 | Same, with v2 | `nvidia-container-toolkit` missing/unconfigured | Re-run §A.3, then `sudo systemctl restart docker` |
 | Same, on Windows | WSL1, or a driver installed inside WSL | `wsl -l -v` must show 2; never install a Linux NVIDIA driver in the distro |
-| Backend container exits immediately with code **139**, no error logged | `cm_backend:gpu` running without GPU access — it segfaults rather than falling back to CPU | Verify `docker run --rm --gpus all nvidia/cuda:12.2.2-base-ubuntu22.04 nvidia-smi` works; if the machine has no GPU, deploy `cm_backend:latest` (the CPU image) instead |
+| Backend container exits immediately with code **139**, no error logged | `cm_backend:gpu` running without GPU access — it segfaults rather than falling back to CPU | Verify `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi` works; if the machine has no GPU, deploy `cm_backend:latest` (the CPU image) instead |
 | `Error response from daemon: could not select device driver "nvidia"` | Toolkit not registered with Docker | `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` |
 | `bind: address already in use` on 5432 | Another Postgres already holds the port — on the dev machine a container named `classroom_pg` does | `docker stop classroom_pg`, or set `POSTGRES_PORT=5433` in `.env` |
 | Behaviour analysis throws on the first frame; startup was clean | Models missing (§3 skipped) | `docker compose exec backend python scripts/00_fetch_models.py --check` |

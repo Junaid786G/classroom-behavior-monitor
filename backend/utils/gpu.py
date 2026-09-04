@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+from functools import lru_cache
 from typing import Any, Dict, List, Union
 
 logger = logging.getLogger(__name__)
@@ -39,11 +40,46 @@ def get_onnx_providers(ctx_id: int = 0) -> List[ProviderSpec]:
     return ["CPUExecutionProvider"]
 
 
+@lru_cache(maxsize=1)
 def cuda_available() -> bool:
+    """True only when a CUDA session can actually be created AND bound.
+
+    ort.get_available_providers() lists the providers COMPILED INTO the build,
+    not the ones that can load. It returns CUDAExecutionProvider even when
+    libonnxruntime_providers_cuda.so fails to open - a cuDNN major-version
+    mismatch does exactly that - and every session then falls back to CPU
+    silently. On 2026-09-02 /health reported gpu_available: true while nothing
+    ran on the GPU. The only honest test is to build a session and ask what it
+    actually bound.
+
+    Cached: the probe is far too costly to run on every /health request, and the
+    answer cannot change within a process.
+    """
     try:
         import onnxruntime as ort
-        return "CUDAExecutionProvider" in ort.get_available_providers()
+        from onnx import TensorProto, helper
     except ImportError:
+        return False
+
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        return False
+
+    try:
+        graph = helper.make_graph(
+            [helper.make_node("Identity", ["x"], ["y"])], "cuda_probe",
+            [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])],
+            [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 9        # ort 1.18 rejects onnx 1.22's newer default
+        opts = ort.SessionOptions()
+        opts.log_severity_level = 3  # the fallback warning is ours to interpret
+        sess = ort.InferenceSession(
+            model.SerializeToString(), opts, providers=["CUDAExecutionProvider"]
+        )
+        return "CUDAExecutionProvider" in sess.get_providers()
+    except Exception as exc:
+        logger.warning("CUDA probe failed; treating GPU as unavailable: %s", exc)
         return False
 
 

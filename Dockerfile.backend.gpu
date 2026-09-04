@@ -1,19 +1,24 @@
 # ────────────────────────────────────────────────────────────────────────────
 # Classroom CCTV Monitor – Backend Dockerfile (NVIDIA GPU variant)
 #
-# Mirrors Dockerfile.backend, but on a CUDA 12.2 + cuDNN 8 base with
+# Mirrors Dockerfile.backend, but on a CUDA 12.4 + cuDNN 9 base with
 # onnxruntime-gpu, so InsightFace / ArcFace and the eye-state ONNX run on the
 # GPU via the CUDAExecutionProvider.
+#
+# The cuDNN MAJOR version is load-bearing: onnxruntime-gpu 1.18.1 from the
+# onnxruntime-cuda-12 feed links libcudnn.so.9. On a cudnn8 base it installs
+# and imports fine, then fails to open the CUDA provider at RUNTIME and
+# silently runs every model on CPU. The runtime assertion below catches that.
 #
 # Two-stage for the same reason as the CPU image: insightface 0.7.3 compiles a
 # Cython C++ extension from source and needs a toolchain at install time.
 #
-# Requires on the host: NVIDIA driver >= 535 and nvidia-container-toolkit.
+# Requires on the host: NVIDIA driver >= 550 and nvidia-container-toolkit.
 # Build:  docker compose -f docker-compose.yml -f docker-compose.gpu.yml build backend
 # ────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: compile dependencies ───────────────────────────────────────────
-FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -53,7 +58,7 @@ print("onnxruntime-gpu", md.version("onnxruntime-gpu"), "OK")
 PY
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────
-FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04 AS runtime
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -78,6 +83,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+
+# Fail the build if the CUDA provider cannot LOAD. The compiled-in provider list
+# is not evidence: ort reports CUDAExecutionProvider even when the .so fails to
+# open, and every session then falls back to CPU silently - which is how a
+# cuDNN 8/9 mismatch shipped unnoticed. There is no GPU during `docker build`, so
+# we cannot open a session here; we CAN prove every shared library resolves.
+RUN python - <<'GPUCHK'
+import pathlib, subprocess, sys, onnxruntime
+lib = pathlib.Path(onnxruntime.__file__).parent / "capi" / "libonnxruntime_providers_cuda.so"
+assert lib.exists(), f"missing {lib}"
+missing = [l.strip() for l in subprocess.run(
+    ["ldd", str(lib)], capture_output=True, text=True).stdout.splitlines()
+    if "not found" in l]
+if missing:
+    sys.exit("CUDA provider has unresolved libraries:\n  " + "\n  ".join(missing))
+print("CUDA provider links cleanly:", lib.name)
+GPUCHK
 
 WORKDIR /app
 
