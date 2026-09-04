@@ -846,3 +846,48 @@ python3 scripts/00_fetch_models.py --check
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml build backend
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 ```
+
+---
+
+## 10. Recreating the desktop icons
+
+`scripts/desktop_*.sh` arrive with the clone and derive their own project
+directory, so they need no editing. The `.desktop` launchers are **not** in the
+repo — a desktop entry needs an absolute `Exec=` path, which is machine-local by
+definition. Recreate them once per machine (GNOME/Ubuntu):
+
+```bash
+cd /path/to/classroom_monitor          # the clone
+REPO="$(pwd)"; DESK="$(xdg-user-dir DESKTOP)"
+
+mk () {   # $1 name  $2 script  $3 icon  $4 comment
+cat > "$DESK/$1.desktop" <<EOD
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=$1
+Comment=$4
+Exec=gnome-terminal --title="$1" -- $REPO/scripts/$2
+Icon=$3
+Terminal=false
+StartupNotify=true
+Categories=Development;
+EOD
+chmod +x "$DESK/$1.desktop"
+gio set "$DESK/$1.desktop" metadata::trusted true    # else GNOME shows "Untrusted"
+}
+
+mk "Start Classroom Monitor"          desktop_start.sh           media-playback-start   "Start the stack, check /health, open the UI"
+mk "Restart Backend (clean state)"    desktop_restart_backend.sh view-refresh           "Fresh backend process before a measured run"
+mk "Dev Mode ON (live editing)"       desktop_dev_mode_on.sh     media-record           "Live-mounted source - NOT the certified baseline"
+mk "Dev Mode OFF (certified baseline)" desktop_dev_mode_off.sh   security-high-symbolic "Back to the baked images"
+```
+
+Then `desktop-file-validate "$DESK"/*.desktop` should print nothing.
+
+Two notes. `Terminal=false` with an explicit `gnome-terminal --` is deliberate:
+GNOME ignores the legacy `Terminal=true` field, and this is what actually opens a
+visible window — the scripts pause for a keypress so it stays readable. And check
+the icon names resolve on that machine (`find /usr/share/icons -name 'media-record.*'`);
+they are not present in every theme, and a missing one renders as a blank square
+rather than failing loudly.
