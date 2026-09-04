@@ -7,6 +7,17 @@ data/videos/
 data/student_photos/
 data/faiss/
 data/behavior_debug/
+
+# T18 ground-truth label set. The clips and contact sheets are croppped faces of
+# real students - the same reason data/student_photos/ and the behaviour_eye
+# fixtures are ignored, and scripts/06_make_eye_fixtures.py spells it out:
+# committing them would put identifiable faces in git history permanently.
+# _scored.jsonl is a 14 MB pipeline cache, regenerable in ~30 min.
+# The small text files are NOT ignored - windows.jsonl, predictions.jsonl and the
+# label CSVs are the actual deliverable and carry no imagery.
+labelset/clips/
+labelset/sheets/
+labelset/_scored.jsonl
 data/presentation_screenshots/
 # ...except the 46 KB eye-state ONNX: its upstream OMZ mirror (download.01.org)
 # is dead, so vendoring it here is the only way a fresh clone gets it.
@@ -27,3 +38,31 @@ models/
 # project's whole point is not putting those somewhere permanent. The tests
 # skipif them away when absent, so a fresh clone still passes.
 backend/tests/fixtures_local/
+
+# FYDP presentation assets. UI screenshots of the dashboard carry real student
+# names and faces - the same reason data/student_photos/, labelset/clips/ and
+# backend/tests/fixtures_local/ are ignored. A commit here is permanent in git
+# history, so images are blocked by DEFAULT and re-included only where someone
+# has confirmed there is nothing identifiable in them. The block is written as
+# file patterns, not a directory rule, because git cannot re-include a file
+# whose parent directory is excluded - a plain presentation/ppt_screenshots/
+# rule would make the charts/ exemption below silently impossible.
+presentation/ppt_screenshots/**/*.png
+presentation/ppt_screenshots/**/*.jpg
+presentation/ppt_screenshots/**/*.jpeg
+presentation/ppt_screenshots/**/*.gif
+presentation/ppt_screenshots/**/*.webp
+presentation/ppt_screenshots/**/*.bmp
+presentation/ppt_screenshots/**/*.tif
+presentation/ppt_screenshots/**/*.tiff
+presentation/ppt_screenshots/**/*.svg
+presentation/ppt_screenshots/**/*.pdf
+presentation/ppt_screenshots/**/*.mp4
+presentation/ppt_screenshots/**/*.mov
+# charts/ is the reviewed exemption: plots drawn FROM numbers - confusion
+# matrices, precision/recall/F1, the scale breakdown - never a capture of the
+# running UI. Put a file here only after confirming it shows no student name,
+# face or id.
+!presentation/ppt_screenshots/charts/**
+# One-off files outside charts/ can be re-included by name after review, e.g.
+# !presentation/ppt_screenshots/01_confusion_matrix_counts.png
