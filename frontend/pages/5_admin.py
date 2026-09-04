@@ -586,9 +586,9 @@ with tab_thresholds:
             return int(default)
 
     _eye_methods = ["cnn", "ear"]
-    _cur_eye_method = str(_env.get("EYE_STATE_METHOD", "cnn")).strip().lower()
+    _cur_eye_method = str(_env.get("EYE_STATE_METHOD", "ear")).strip().lower()
     if _cur_eye_method not in _eye_methods:
-        _cur_eye_method = "cnn"
+        _cur_eye_method = "ear"
     eye_state_method = st.radio(
         "Eye State Method",
         _eye_methods,
@@ -607,7 +607,7 @@ with tab_thresholds:
         )
         late_thr = st.slider(
             "Late Threshold (minutes)", 1, 30,
-            _envi("LATE_THRESHOLD_MINUTES", 10), 1,
+            _envi("LATE_THRESHOLD_MINUTES", 15), 1,
         )
         sleep_sec = st.slider(
             "Sleeping Sustain (seconds)", 0.5, 10.0,

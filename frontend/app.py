@@ -132,7 +132,7 @@ def _session_summary(user_id: int, session_id: str, classroom_id: int) -> dict:
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="cctv-header">
-  <h1>🎥 CLASSROOM CCTV MONITOR</h1>
+  <h1>🎥 CAE CLASSROOM CCTV MONITORING</h1>
   <p>AI-Powered Attendance &amp; Behavioural Analysis — InsightFace · ByteTrack · MediaPipe</p>
 </div>
 """, unsafe_allow_html=True)

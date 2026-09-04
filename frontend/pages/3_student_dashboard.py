@@ -322,7 +322,14 @@ with col_a:
     if active_session_id:
         # Poll in a fragment so ONLY this panel reruns. A page-level st.rerun
         # every 3s would re-fetch attendance and redraw every chart on the page.
-        @st.fragment(run_every=3)
+        # st.fragment is 1.37+; requirements.txt pins streamlit==1.35.0, where
+        # the same feature is st.experimental_fragment with an identical
+        # run_every. The host venv runs 1.58, which has REMOVED the experimental
+        # alias - so neither name works in both places and the lookup has to be
+        # dynamic. Behaviour is unchanged either way.
+        _fragment = getattr(st, "fragment", None) or st.experimental_fragment
+
+        @_fragment(run_every=3)
         def _live_behaviour() -> None:
             events = _behavior_events_live(active_session_id, student_id)
             st.caption(
