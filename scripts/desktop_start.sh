@@ -57,6 +57,20 @@ start_one() {
     return 1
 }
 
+# classroom_pg belongs to the AI Lab PC only — the Radar Lab PC has never had
+# it. Absent means "not applicable on this machine", not a failure. If it IS
+# present it is started and reported exactly like any required container, and
+# a genuine failure to start still counts. Only classroom_pg is optional; every
+# cm_* container stays required.
+start_optional_one() {
+    local name="$1"
+    if ! docker inspect "$name" >/dev/null 2>&1; then
+        echo "  ${CYA}–${RS} $name not present on this machine — skipping (optional)"
+        return 0
+    fi
+    start_one "$name"
+}
+
 # Poll until healthy rather than sleeping blind. Containers without a
 # healthcheck (classroom_pg) only need to be running.
 wait_healthy() {
@@ -75,12 +89,57 @@ wait_healthy() {
     return 1
 }
 
+# WSL2 cold-boot quirk: on this machine the bind-mounted host models folder
+# has twice come up EMPTY inside cm_backend even though the host copy is fine.
+# /health still answers "ok" in that state, so the healthcheck alone cannot be
+# trusted — look at the actual file. A single `docker restart` has always
+# cleared it (it is a mount-staleness problem, not a missing-file problem).
+MODEL_FILE=/app/models/face_landmarker.task
+
+models_visible() { docker exec cm_backend test -f "$MODEL_FILE" >/dev/null 2>&1; }
+
+verify_backend_models() {
+    if models_visible; then
+        echo "  ${GRN}✓${RS} models visible inside cm_backend ($MODEL_FILE)"
+        return 0
+    fi
+
+    echo "  ${YEL}!${RS} $MODEL_FILE is MISSING inside cm_backend"
+    echo "     (known WSL2 bind-mount staleness — /health can still say ok)"
+    echo "     restarting cm_backend once to re-mount…"
+    if ! docker restart cm_backend >/dev/null 2>&1; then
+        echo "  ${RED}✗ docker restart cm_backend failed${RS}"
+        return 1
+    fi
+    wait_healthy cm_backend 150 || return 1
+
+    if models_visible; then
+        echo "  ${GRN}✓${RS} models visible after restart — backend genuinely ready"
+        return 0
+    fi
+
+    echo
+    echo "${RED}✗ $MODEL_FILE is STILL missing after one restart.${RS}"
+    echo "${RED}  Stopping here — do NOT use the app in this state; face and${RS}"
+    echo "${RED}  behaviour analysis would run against a model that isn't there.${RS}"
+    echo
+    echo "  Investigate manually:"
+    echo "    docker exec cm_backend ls -l /app/models"
+    echo "    ls -l ./models          # the host side of the bind mount"
+    echo "    docker inspect -f '{{json .Mounts}}' cm_backend"
+    echo
+    echo "  What the container currently sees in /app/models:"
+    docker exec cm_backend ls -la /app/models 2>&1 | sed 's/^/    /'
+    return 1
+}
+
 failed=0
 
 # ── 1. Data layer first ──────────────────────────────────────────────────────
 echo
 echo "${BOLD}[1/3] Databases and cache${RS}"
-for c in classroom_pg cm_postgres cm_redis; do start_one "$c" || failed=1; done
+start_optional_one classroom_pg || failed=1
+for c in cm_postgres cm_redis; do start_one "$c" || failed=1; done
 wait_healthy cm_postgres 90 || failed=1
 wait_healthy cm_redis    60 || failed=1
 
@@ -90,6 +149,8 @@ echo "${BOLD}[2/3] Backend${RS}"
 start_one cm_backend || failed=1
 echo "  (model loading can take up to ~90s on first start)"
 wait_healthy cm_backend 150 || failed=1
+# Healthy is not the same as ready — confirm the model file is really there.
+verify_backend_models || pause_and_exit 1
 
 # ── 3. Frontend ──────────────────────────────────────────────────────────────
 echo
