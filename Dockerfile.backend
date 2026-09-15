@@ -77,5 +77,9 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
 
+# --ws-ping-timeout far above uvicorn's 20s default: the Live Monitor upload
+# path is browser-pumped, and websocket-client only pongs from inside recv(),
+# which stops while the instructor is on another page. See docker-compose.yml.
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", \
-     "--workers", "1", "--loop", "asyncio"]
+     "--workers", "1", "--loop", "asyncio", \
+     "--ws-ping-interval", "20", "--ws-ping-timeout", "3600"]

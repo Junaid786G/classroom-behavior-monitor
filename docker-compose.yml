@@ -95,6 +95,15 @@ services:
     image: cm_backend:latest
     container_name: cm_backend
     restart: unless-stopped
+    # --ws-ping-timeout is raised far above uvicorn's 20s default ON PURPOSE.
+    # The Live Monitor upload path is browser-pumped: websocket-client only
+    # answers a server PING from inside recv(), and recv() only runs while that
+    # page is rerunning. Navigate to Attendance and the pongs stop, so at the
+    # default the server closed the connection after ~40s with
+    # "keepalive ping timeout" - which runs the handler's finally, marks the
+    # session COMPLETED and writes ABSENT rows for a half-processed video.
+    # The 20s ping is KEPT so a genuinely dead client is still detected by the
+    # handler's own 30s idle heartbeat failing to write.
     command: >
       uvicorn backend.main:app
         --host 0.0.0.0
@@ -102,6 +111,8 @@ services:
         --workers 1
         --loop asyncio
         --log-level info
+        --ws-ping-interval 20
+        --ws-ping-timeout 3600
     environment:
       DATABASE_URL:            postgresql+asyncpg://${POSTGRES_USER:-cm_user}:${POSTGRES_PASSWORD:-cm_password}@postgres:5432/${POSTGRES_DB:-classroom_monitor}
       REDIS_URL:               redis://redis:6379/0
