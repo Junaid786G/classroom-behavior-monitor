@@ -30,8 +30,8 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_LIVE_MONITOR, require_page_access
-from ui import (as_display as _as_display, format_session_when,
-                session_delete_widget)
+from ui import (as_display as _as_display, drain_to_frame_result,
+                format_session_when, session_delete_widget)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -175,7 +175,7 @@ class _WSMonitor:
     """
 
     def __init__(self, session_id: str, send_annotated: bool = True, source_fps: float = 0.0,
-                 auth_header: Optional[dict] = None):
+                 auth_header: Optional[dict] = None, total_frames: int = 0):
         self.session_id = session_id
         self.send_annotated = send_annotated
         # Captured on the main thread and carried, rather than read at connect
@@ -185,6 +185,10 @@ class _WSMonitor:
         # Declared to the server so it can reconstruct real video time: we send
         # every (_SKIP_FRAMES + 1)th frame, not consecutive ones.
         self.source_fps = source_fps
+        # Declared so OTHER pages can show a progress fraction while this runs.
+        # The video never leaves this browser, so the server has no other way to
+        # learn how long it is. Optional server-side: 0 means "unknown".
+        self.total_frames = total_frames
         self._result_q: queue.Queue = queue.Queue(maxsize=30)
         self._ws = None
         self._connected = False
@@ -203,6 +207,7 @@ class _WSMonitor:
             f"?send_annotated={'true' if self.send_annotated else 'false'}"
             f"&frame_step={_SKIP_FRAMES + 1}"
             f"&source_fps={self.source_fps or 0}"
+            f"&total_frames={self.total_frames or 0}"
         )
         try:
             self._ws = websocket.WebSocket()
@@ -227,22 +232,17 @@ class _WSMonitor:
         try:
             self._ws.send_binary(frame_jpeg)
             self._ws.settimeout(10)
-            raw = self._ws.recv()
-            if not raw:
-                # The server closed rather than answering. Say so: parsing ""
-                # as JSON reports "Expecting value: line 1 column 1", which
-                # sends you looking for a protocol bug instead of a refused or
-                # dropped connection.
-                self._error = (
-                    "the server closed the connection without a result "
-                    "(session rejected, or the backend restarted mid-run)"
-                )
+            # Skips the {"ping": true} heartbeats that queue up while this page
+            # is not rerunning - i.e. while the instructor is on Attendance.
+            # Without this the first frames after navigating back read a stale
+            # heartbeat instead of their own result and the preview freezes,
+            # even though every frame is still being processed server-side.
+            result, error = drain_to_frame_result(self._ws.recv)
+            if error:
+                self._error = error
                 self._connected = False
                 return None
-            data = json.loads(raw)
-            if "frame_number" in data:
-                return data
-            return None
+            return result
         except Exception as exc:
             self._error = str(exc)
             self._connected = False
@@ -344,6 +344,7 @@ def _connect_and_process() -> bool:
         send_annotated=True,
         source_fps=st.session_state.get("source_fps", 0.0),
         auth_header=auth_headers(),
+        total_frames=int(st.session_state.get("total_frames", 0) or 0),
     )
     if not monitor.connect():
         st.error(f"WebSocket error: {monitor.error}")

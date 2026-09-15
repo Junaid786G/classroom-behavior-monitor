@@ -516,3 +516,116 @@ h3 { color: var(--text-hi) !important; font-family: var(--font-mono) !important;
   color: var(--text-hi);
   font-size: 0.88rem;
 }
+
+/* ── Active session card ───────────────────────────────────────────────────── */
+/* Shown at the top of every page EXCEPT Live Monitor, whenever a session is
+   being processed. It refreshes itself inside an st.experimental_fragment, so
+   the numbers move without the host page rerunning.
+   Rendered by ui.render_active_session_card(). */
+.session-banner {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--green);
+  border-radius: 6px;
+  padding: 0.85rem 1.1rem 0.9rem;
+  margin: 0 0 0.15rem 0;
+}
+.session-banner.is-warning { border-left-color: var(--orange); }
+
+.session-banner-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.45rem;
+}
+.session-banner-label {
+  font-family: var(--font-hud);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--green-dim);
+}
+.session-banner.is-warning .session-banner-label { color: var(--orange); }
+
+/* The pulse is the "still alive" signal — a static card and a stalled card look
+   identical, which is the whole problem this element exists to solve. */
+.session-banner-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: session-pulse 1.6s ease-in-out infinite;
+  flex: 0 0 auto;
+}
+@keyframes session-pulse {
+  0%, 100% { opacity: 1;    box-shadow: 0 0 0 0    rgba(58,125,68,0.45); }
+  50%      { opacity: 0.55; box-shadow: 0 0 0 5px  rgba(58,125,68,0); }
+}
+.session-banner-warn { color: var(--orange); font-size: 0.95rem; line-height: 1; }
+
+.session-banner-title {
+  font-size: 1.02rem;
+  font-weight: 600;
+  color: var(--text-hi);
+  margin-bottom: 0.55rem;
+}
+.session-banner-course { font-weight: 400; color: var(--text-mid); }
+
+.session-banner-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  margin-bottom: 0.45rem;
+}
+.session-banner-track {
+  flex: 1 1 auto;
+  height: 7px;
+  background: var(--bg-panel);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.session-banner-fill {
+  height: 100%;
+  background: var(--green);
+  border-radius: 4px;
+  transition: width 0.6s ease;
+}
+.session-banner.is-warning .session-banner-fill { background: var(--orange); }
+
+/* A camera feed declares no total, so there is no fraction to draw. A sliding
+   segment says "running" where a full-width bar would say "finished". */
+.session-banner-fill.is-indeterminate {
+  width: 32%;
+  animation: session-slide 1.9s ease-in-out infinite;
+}
+@keyframes session-slide {
+  0%   { margin-left: 0%;  }
+  50%  { margin-left: 68%; }
+  100% { margin-left: 0%;  }
+}
+
+.session-banner-pct {
+  font-family: var(--font-hud);
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--green-dim);
+  min-width: 2.8rem;
+  text-align: right;
+}
+.session-banner.is-warning .session-banner-pct { color: var(--orange); }
+
+.session-banner-facts {
+  font-family: var(--font-hud);
+  font-size: 0.78rem;
+  color: var(--text-mid);
+  letter-spacing: 0.02em;
+}
+.session-banner-note {
+  font-size: 0.78rem;
+  color: var(--orange);
+  margin-top: 0.4rem;
+}
+
+/* The page_link that follows the card is a separate Streamlit block, so it
+   cannot live inside the div above. Pull it up so the two read as one unit. */
+.session-banner + div [data-testid="stPageLink"] { margin-top: -0.1rem; }

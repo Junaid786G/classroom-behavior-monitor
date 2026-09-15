@@ -26,7 +26,8 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_COURSE_OVERVIEW, require_page_access
-from ui import as_display as _as_display, format_session_when
+from ui import (as_display as _as_display, format_session_when,
+                render_active_session_card)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -108,6 +109,15 @@ def _session_label(row: dict) -> str:
 
 def _pct(value) -> str:
     return "—" if value is None else f"{value:.0%}"
+
+
+# ── Active session card ───────────────────────────────────────────────────────
+# Renders only while a session is actually being processed, and refreshes itself
+# on its own timer without rerunning this page. Placed ABOVE this page's header
+# rather than below it because several of these pages st.stop() early (an empty
+# classroom, a course with no sessions) and would skip anything placed after.
+# Passing this page's own _get gives it these auth headers and 401 bounce.
+render_active_session_card(_get)
 
 
 # ── Sidebar – course selector ─────────────────────────────────────────────────

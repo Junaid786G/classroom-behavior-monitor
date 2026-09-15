@@ -154,3 +154,231 @@ def test_unknown_subject_contributes_nothing_rather_than_a_blank_entry():
     ctx = ui.resolve_session_context(
         [{"id": "z", "subject_id": 999}], SUBJECTS, COURSES)
     assert ctx["subject_label"] == "—" and ctx["course_label"] == "—"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ACTIVE SESSION CARD
+# ══════════════════════════════════════════════════════════════════════════════
+# The card is what a page other than Live Monitor shows while a session is being
+# processed. These cover the decision of WHAT to render, which is the part with
+# judgement in it; the HTML around it is markup.
+
+
+# ── Number formatting ─────────────────────────────────────────────────────────
+
+def test_format_count_uses_thousands_separators():
+    # The whole point of the number is to be read at a glance from across a
+    # room, which "11499" is not.
+    assert ui.format_count(11499) == "11,499"
+    assert ui.format_count(0) == "0"
+
+
+def test_format_count_survives_rubbish():
+    assert ui.format_count(None) == "—"
+    assert ui.format_count("not a number") == "—"
+
+
+@pytest.mark.parametrize("seconds,expected", [
+    (0, "00:00"),
+    (9, "00:09"),
+    (200, "03:20"),
+    (3600, "1:00:00"),
+    (3725, "1:02:05"),
+])
+def test_format_clock(seconds, expected):
+    assert ui.format_clock(seconds) == expected
+
+
+def test_format_clock_survives_rubbish():
+    assert ui.format_clock(None) == "—"
+    assert ui.format_clock(-5) == "00:00"
+
+
+# ── ETA ───────────────────────────────────────────────────────────────────────
+
+def test_eta_is_suppressed_until_the_sample_is_worth_trusting():
+    # An ETA that swings between "2 minutes" and "40 minutes" on consecutive
+    # ticks is worse than no ETA, especially on a projector. Below these
+    # thresholds the caller omits the clause entirely.
+    assert ui.format_eta(1, 11499, 2.0) is None        # too early
+    assert ui.format_eta(1, 11499, 30.0) is None       # too few frames
+
+
+def test_eta_needs_a_declared_total():
+    # A camera feed has no end, so there is nothing to count down to.
+    assert ui.format_eta(500, 0, 60.0) is None
+
+
+def test_eta_reports_remaining_time_once_the_rate_is_known():
+    # 100 frames in 10s = 10 fps; 900 left => ~90s.
+    assert ui.format_eta(100, 1000, 10.0) == "~1m 30s remaining"
+
+
+def test_eta_uses_seconds_under_a_minute_and_hours_over_one():
+    assert ui.format_eta(950, 1000, 10.0) == "~1s remaining"
+    assert ui.format_eta(100, 100000, 10.0) == "~2h 46m remaining"
+
+
+def test_eta_is_none_at_or_past_the_total():
+    assert ui.format_eta(1000, 1000, 100.0) is None
+    assert ui.format_eta(1200, 1000, 100.0) is None
+
+
+# ── Which card to render ──────────────────────────────────────────────────────
+
+def _running(**kw):
+    item = {
+        "session_id": "abc",
+        "state": "running",
+        "frames_processed": 4850,
+        "total_frames": 11499,
+        "elapsed_seconds": 200.0,
+        "subject_label": "AV-423 — Cybersecurity",
+        "course_label": "CS-2021 Computer Science",
+    }
+    item.update(kw)
+    return item
+
+
+def test_running_session_renders_a_card_with_progress():
+    m = ui.active_card_model(_running())
+    assert m["kind"] == "running"
+    assert m["headline"] == "SESSION IN PROGRESS"
+    assert m["percent"] == 42
+    assert m["title"] == "AV-423 — Cybersecurity"
+    assert "Frame 4,850 / 11,499" in m["facts"][0]
+    assert "Elapsed 03:20" in m["facts"][1]
+
+
+def test_completed_session_renders_nothing():
+    # Specified behaviour: by the time a run finishes the reader is already on
+    # the page holding its results, and a banner announcing completion would
+    # compete with the rows it is announcing.
+    assert ui.active_card_model(_running(state="completed")) is None
+
+
+def test_ended_early_session_still_renders():
+    # This is the visible symptom of a dropped Live Monitor connection. Hiding
+    # it is what leaves someone wondering whether anything broke.
+    m = ui.active_card_model(_running(state="ended_early"))
+    assert m["kind"] == "ended_early"
+    assert m["headline"] == "RUN ENDED EARLY"
+
+
+def test_ended_early_card_carries_no_eta():
+    # Nothing is still running, so there is nothing to finish.
+    m = ui.active_card_model(_running(state="ended_early"))
+    assert not any("remaining" in f for f in m["facts"])
+
+
+def test_no_item_renders_nothing():
+    assert ui.active_card_model(None) is None
+    assert ui.active_card_model({}) is None
+
+
+def test_unknown_state_renders_nothing():
+    # Fail closed: a state this version does not understand is not drawn as if
+    # it were running.
+    assert ui.active_card_model(_running(state="teleporting")) is None
+
+
+def test_missing_total_frames_gives_a_bare_count_and_no_percentage():
+    # RTSP declares no total. A denominator must not be invented, and a
+    # full-width bar would read as "finished".
+    m = ui.active_card_model(_running(total_frames=0))
+    assert m["percent"] is None
+    assert m["facts"][0] == "Frame 4,850"
+
+
+def test_missing_labels_fall_back_without_raising():
+    m = ui.active_card_model(_running(subject_label=None, course_label=None))
+    assert m["title"] == "Session"
+    assert m["course"] == ""
+
+
+def test_card_html_contains_the_numbers_and_the_right_tone():
+    running_html = ui._card_html(ui.active_card_model(_running()))
+    assert "42%" in running_html
+    assert "4,850" in running_html
+    assert "is-running" in running_html
+
+    early_html = ui._card_html(ui.active_card_model(_running(state="ended_early")))
+    assert "is-warning" in early_html
+    assert "connection was interrupted" in early_html
+
+
+# ── WebSocket heartbeat drain ─────────────────────────────────────────────────
+# Covers the resume path: what the Live Monitor pump reads on the first frames
+# after the instructor navigates back. Surfaced by an end-to-end run, where the
+# first frame back read a queued heartbeat instead of its own result.
+
+def _recv_from(messages):
+    """A fake socket recv() that hands back `messages` in order."""
+    queue = list(messages)
+
+    def recv():
+        return queue.pop(0) if queue else ""
+
+    return recv
+
+
+def test_drain_returns_a_frame_result_immediately_when_there_is_no_backlog():
+    # The common case - the instructor never left the page. Must behave exactly
+    # as the old single-read code did.
+    result, error = ui.drain_to_frame_result(
+        _recv_from(['{"frame_number": 7, "detections": []}'])
+    )
+    assert error is None
+    assert result["frame_number"] == 7
+
+
+def test_drain_skips_queued_heartbeats_and_returns_the_real_result():
+    # Two 30s heartbeats queued during a ~60s absence, then the frame's result.
+    result, error = ui.drain_to_frame_result(
+        _recv_from(['{"ping": true}', '{"ping": true}', '{"frame_number": 12}'])
+    )
+    assert error is None
+    assert result["frame_number"] == 12
+
+
+def test_drain_reports_a_closed_socket():
+    result, error = ui.drain_to_frame_result(_recv_from([""]))
+    assert result is None
+    assert error == ui.WS_CLOSED_MESSAGE
+
+
+def test_drain_reports_a_close_that_arrives_behind_heartbeats():
+    result, error = ui.drain_to_frame_result(_recv_from(['{"ping": true}', ""]))
+    assert result is None
+    assert error == ui.WS_CLOSED_MESSAGE
+
+
+def test_drain_skips_unparseable_messages_rather_than_ending_the_session():
+    result, error = ui.drain_to_frame_result(
+        _recv_from(["<not json>", '{"frame_number": 3}'])
+    )
+    assert error is None
+    assert result["frame_number"] == 3
+
+
+def test_drain_is_bounded_and_reports_nothing_conclusive():
+    # A server sending only heartbeats must not spin here. No result and no
+    # error: the caller has nothing for this frame and simply carries on.
+    result, error = ui.drain_to_frame_result(
+        _recv_from(['{"ping": true}'] * (ui._WS_DRAIN_LIMIT + 5))
+    )
+    assert result is None
+    assert error is None
+
+
+def test_drain_does_not_read_further_than_it_has_to():
+    # One read for the result, and no speculative read past it - the next
+    # message belongs to the next frame.
+    reads = []
+
+    def recv():
+        reads.append(1)
+        return '{"frame_number": 1}'
+
+    ui.drain_to_frame_result(recv)
+    assert len(reads) == 1

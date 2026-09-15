@@ -21,7 +21,8 @@ from auth import (
     require_login,
 )
 from permissions import PAGE_ATTENDANCE, can_write_attendance, require_page_access
-from ui import filter_sessions, format_session_when, resolve_session_context
+from ui import (filter_sessions, format_session_when,
+                render_active_session_card, resolve_session_context)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -129,6 +130,15 @@ def _export_csv(session_id: str) -> Optional[bytes]:
         return r.content if r.ok else None
     except Exception:
         return None
+
+
+# ── Active session card ───────────────────────────────────────────────────────
+# Renders only while a session is actually being processed, and refreshes itself
+# on its own timer without rerunning this page. Placed ABOVE this page's header
+# rather than below it because several of these pages st.stop() early (an empty
+# classroom, a course with no sessions) and would skip anything placed after.
+# Passing this page's own _get gives it these auth headers and 401 bounce.
+render_active_session_card(_get)
 
 
 # ── Sidebar – session selector ────────────────────────────────────────────────
