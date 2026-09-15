@@ -67,8 +67,8 @@ class Settings(BaseSettings):
     # ── Behavior thresholds ───────────────────────────────────────────────────
     behavior_yaw_threshold: float = Field(30.0, ge=0.0, le=90.0)
     behavior_pitch_head_down: float = Field(15.0, ge=0.0, le=90.0)
-    behavior_yaw_deviation: float = Field(25.0, ge=0.0, le=90.0)
-    behavior_pitch_deviation: float = Field(15.0, ge=0.0, le=90.0)
+    behavior_yaw_deviation: float = Field(15.0, ge=0.0, le=90.0)
+    behavior_pitch_deviation: float = Field(18.0, ge=0.0, le=90.0)
     behavior_sleep_ratio: float = Field(0.45, ge=0.0, le=1.0)
     behavior_sleeping_seconds: float = Field(1.5, ge=0.0, le=10.0)
     # A yaw this far off-axis is looking away no matter WHOSE head it is, so it

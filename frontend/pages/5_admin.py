@@ -607,7 +607,7 @@ with tab_thresholds:
         )
         late_thr = st.slider(
             "Late Threshold (minutes)", 1, 30,
-            _envi("LATE_THRESHOLD_MINUTES", 15), 1,
+            _envi("LATE_THRESHOLD_MINUTES", 10), 1,
         )
         sleep_sec = st.slider(
             "Sleeping Sustain (seconds)", 0.5, 10.0,
