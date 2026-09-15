@@ -155,7 +155,21 @@ class _Client:
         body = _json.dumps(json).encode() if json is not None else b""
         sent = []
 
+        _receive_calls = [0]
+
         async def receive():
+            # A real ASGI server sends the body ONCE and then blocks until the client
+            # disconnects. Returning http.request on EVERY call - as this helper used to -
+            # breaks starlette's BaseHTTPMiddleware, which @app.middleware("http") in
+            # main.py puts in front of every route: it calls receive() again after the
+            # body, gets a second http.request where it expects to block, and raises
+            # "Unexpected message received: http.request". Returning http.disconnect
+            # instead is NOT the fix - starlette then aborts and the response body is
+            # empty. This is what made 82 tests across four files fail from the day they
+            # were written; see the Testing section of README.md.
+            _receive_calls[0] += 1
+            if _receive_calls[0] > 1:
+                await anyio.sleep_forever()
             return {"type": "http.request", "body": body, "more_body": False}
 
         async def send(message):

@@ -67,19 +67,25 @@ Frontend runs at http://localhost:8501, backend API at http://localhost:8000.
 video-timestamp handling, the TRAINING_CONTROL write surface, session deletion, and the
 active-session progress registry.
 
-**Known issue — 82 of them fail, and always have.** `test_login_role_selection.py` (29),
-`test_training_control_routes.py` (28), `test_session_deletion.py` (22) and
-`test_gallery_index_sync.py` (3) all fail with
-`RuntimeError: Unexpected message received: http.request`, buried under four levels of
-`anyio` ExceptionGroup. They are the four files that drive the app through a hand-rolled
-ASGI call instead of `TestClient`, and their fake `receive()` returns `http.request` on
-EVERY call. A real server sends the body once and then blocks; `@app.middleware("http")`
-(main.py, `add_request_timing`) wraps the app in starlette's `BaseHTTPMiddleware`, which
-calls `receive()` again after the body, gets a second `http.request`, and raises. Verified
-pre-existing: the same node ids fail at the commits that first introduced each file, so
-these have never passed. Low priority and test-only — no production code is involved.
-The fix is three lines per file (`await anyio.sleep_forever()` on the second call instead
-of returning); with it applied the suite is 269 passed, 19 skipped, 0 failed.
+All of them pass. That was not true until 2026-09-15: 82 across
+`test_login_role_selection.py` (29), `test_training_control_routes.py` (28),
+`test_session_deletion.py` (22) and `test_gallery_index_sync.py` (3) had failed
+from the day each was written, with `RuntimeError: Unexpected message received:
+http.request` buried under four levels of `anyio` ExceptionGroup — which reads
+like a product fault and was not one.
+
+Those four are the files that drive the app through a hand-rolled ASGI call
+instead of `TestClient`, and their fake `receive()` returned `http.request` on
+EVERY call. A real server sends the body once and then blocks; `@app.middleware
+("http")` (main.py, `add_request_timing`) wraps the app in starlette's
+`BaseHTTPMiddleware`, which calls `receive()` again after the body, gets a second
+`http.request` where it expects to block, and raises. The helpers now park on
+`anyio.sleep_forever()` from the second call. Returning `http.disconnect` instead
+looks like the obvious fix and is not — starlette aborts the response and the
+body comes back empty.
+
+Keep that in mind before adding a fifth hand-rolled ASGI helper: prefer
+`TestClient`, which is why the other files never had the problem.
 
 ## Development history
 
