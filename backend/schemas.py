@@ -582,6 +582,32 @@ class LiveStatusOut(BaseModel):
     frame_b64: Optional[str] = None         # latest annotated JPEG, base64
 
 
+# ── Active session progress ───────────────────────────────────────────────────
+# What a page OTHER than Live Monitor needs to say "this is still running".
+# Deliberately not SessionOut: that reads the database, where
+# total_frames_processed stays 0 until the run ends and so cannot show progress.
+# Source is backend.session_progress, held in memory and updated per frame.
+
+class ActiveSessionOut(BaseModel):
+    session_id: str
+    source: str                             # upload | live
+    state: str                              # running | completed | ended_early
+    started_at: datetime
+    updated_at: datetime
+    finished_at: Optional[datetime] = None
+    frames_processed: int = 0
+    #: 0 means "no declared total" — always so for RTSP, which has no end. The
+    #: UI must render a bare count in that case, not a fabricated denominator.
+    total_frames: int = 0
+    subject_label: Optional[str] = None
+    course_label: Optional[str] = None
+    elapsed_seconds: float = 0.0
+
+
+class ActiveSessionsOut(BaseModel):
+    items: List[ActiveSessionOut] = []
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 class HealthResponse(BaseModel):

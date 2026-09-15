@@ -27,7 +27,7 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend import crud
+from backend import crud, session_progress
 from backend.config import get_settings
 from backend.database import AsyncSessionLocal, get_db
 from backend.deps import (
@@ -61,6 +61,8 @@ from backend.pipeline.live_worker import (
     validate_stream_url,
 )
 from backend.schemas import (
+    ActiveSessionOut,
+    ActiveSessionsOut,
     BulkSessionDeleteRequest,
     SessionDeleteRequest,
     SessionDeleteResponse,
@@ -136,6 +138,63 @@ async def list_sessions(
         limit=limit,
     )
     return Page(total=total, skip=skip, limit=limit, items=[SessionOut.model_validate(r) for r in rows])
+
+
+# ── Active session status ─────────────────────────────────────────────────────
+
+@router.get("/sessions/active", response_model=ActiveSessionsOut)
+async def list_active_sessions(user: User = Depends(get_current_user)):
+    """What is being processed RIGHT NOW, with live progress.
+
+    Exists because the database cannot answer this question mid-run:
+    sessions.total_frames_processed is written once, in the WebSocket handler's
+    `finally`, so it reads 0 for the entire duration of a session and no
+    progress bar can be built from it. The source here is
+    backend.session_progress, held in memory and updated once per frame.
+
+    Cheap on purpose - a pure dict read behind a lock, no database round trip -
+    because every open page polls it every couple of seconds.
+
+    ROUTE ORDER MATTERS. This must be declared before /sessions/{session_id},
+    which is why it sits above the deletion block rather than beside
+    /live/active. Starlette matches in declaration order, and "active" is a
+    valid-looking path segment that the UUID-typed route would otherwise claim
+    and reject as a 422.
+
+    Scoped like list_sessions: a HOD sees every run, an INSTRUCTOR only runs in
+    the subjects they are assigned, and a STUDENT sees none. Without the last
+    clause a student on their portal would learn which lectures are being
+    recorded department-wide.
+    """
+    rows = session_progress.snapshot_all()
+
+    if user.role is UserRole.STUDENT:
+        rows = []
+    elif user.role is UserRole.INSTRUCTOR:
+        allowed = {subject_id for _, subject_id in assignment_pairs(user)}
+        # A row with no subject_id is not attributable, so it is not shown to a
+        # scoped role. Fail closed: the alternative leaks one line of another
+        # course's timetable every time a label lookup fails.
+        rows = [r for r in rows if r.subject_id in allowed]
+
+    return ActiveSessionsOut(
+        items=[
+            ActiveSessionOut(
+                session_id=r.session_id,
+                source=r.source,
+                state=r.state,
+                started_at=r.started_at,
+                updated_at=r.updated_at,
+                finished_at=r.finished_at,
+                frames_processed=r.frames_processed,
+                total_frames=r.total_frames,
+                subject_label=r.subject_label,
+                course_label=r.course_label,
+                elapsed_seconds=r.elapsed_seconds,
+            )
+            for r in rows
+        ]
+    )
 
 
 # ── Deletion ──────────────────────────────────────────────────────────────────
@@ -217,6 +276,7 @@ async def delete_session(
     deleted = await crud.delete_session(db, session_id)
     if not deleted:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
+    session_progress.forget(session_id)
     logger.warning(
         "session %s deleted (subject=%s status=%s)",
         session_id, session.subject_id, session.status.value,
@@ -267,6 +327,8 @@ async def delete_course_sessions(
 
     ids = [s.id for s in sessions]
     deleted = await crud.delete_course_sessions(db, course_id, payload.subject_id)
+    for sid in ids:
+        session_progress.forget(sid)
     logger.warning(
         "BULK DELETE course=%s subject=%s removed %d sessions",
         course_id, payload.subject_id, deleted,
@@ -663,6 +725,7 @@ async def live_stream(
     send_annotated: bool = Query(False, description="Include base64-encoded annotated JPEG in response"),
     frame_step: int = Query(1, ge=1, description="Source frames advanced per WS message (client decimation)"),
     source_fps: float = Query(0.0, ge=0.0, description="Source video fps; 0 = fall back to the configured rate"),
+    total_frames: int = Query(0, ge=0, description="Source frames in the whole video; 0 = unknown"),
 ):
     """
     Real-time face recognition WebSocket endpoint.
@@ -721,6 +784,30 @@ async def live_stream(
         roster_ids = frozenset(student_map)
 
         await crud.start_session(db, session_id)
+
+        # Publish this run to the in-memory progress registry so pages other
+        # than Live Monitor can show that it is still going. Labels are resolved
+        # from the row rather than taken from the client, and every call into
+        # session_progress is non-raising by construction - see that module's
+        # docstring. Nothing below this point may depend on it having worked.
+        labels = await crud.get_session_labels(db, session_id) or {}
+
+    subject_label = (
+        f"{labels.get('subject_code', '')} — {labels.get('subject_name', '')}".strip(" —")
+        or None
+    )
+    course_label = (
+        f"{labels.get('course_code', '')} {labels.get('course_name', '')}".strip()
+        or None
+    )
+    session_progress.begin(
+        session_id,
+        source="upload",
+        total_frames=total_frames,
+        subject_label=subject_label,
+        course_label=course_label,
+        subject_id=session.subject_id if session else None,
+    )
 
     late_after = session.started_at + timedelta(minutes=settings.late_threshold_minutes) if session and session.started_at else None
 
@@ -783,12 +870,24 @@ async def live_stream(
             )
             await websocket.send_json(msg.model_dump())
             msg_index += 1
+            # SOURCE frame index, not msg_index: the card compares this against
+            # the client's declared total_frames, which counts source frames.
+            # Mixing the two units would read "460 / 11,499" on a finished run.
+            session_progress.note_frame(session_id, frame_number)
 
     except WebSocketDisconnect:
         logger.info("WS live session=%s disconnected after %d frames", session_id, msg_index)
     except Exception as exc:
         logger.exception("WS live session=%s error: %s", session_id, exc)
     finally:
+        # Close the progress record out first, so a page polling during teardown
+        # sees a terminal state rather than a run frozen at its last frame.
+        # completed vs ended_early is derived from frame_number against the
+        # declared total - the handler itself cannot tell a clean end-of-video
+        # close from a dropped connection, since both arrive as the same
+        # WebSocketDisconnect.
+        session_progress.finish(session_id, frame_number)
+
         # Let in-flight persistence finish before closing the session out.
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)

@@ -356,6 +356,33 @@ async def get_session_course_id(db: AsyncSession, session_id: UUID) -> Optional[
     return r.scalar_one_or_none()
 
 
+async def get_session_labels(db: AsyncSession, session_id: UUID) -> Optional[dict]:
+    """Human-readable course + subject labels for one session.
+
+    Used to name a session on pages that are not showing it — the active-session
+    card reads "AV-423 — Cybersecurity", not a UUID. Resolved here rather than
+    passed up from the client so the label cannot disagree with the row: the
+    browser's copy is whatever a selectbox held when the session was started.
+
+    Returns None only when the session does not exist; subject_id is NOT NULL
+    with an FK to subjects, so an existing session always resolves both sides.
+    """
+    r = await db.execute(
+        select(
+            Subject.subject_code,
+            Subject.subject_name,
+            Course.code.label("course_code"),
+            Course.name.label("course_name"),
+        )
+        .select_from(Session)
+        .join(Subject, Subject.id == Session.subject_id)
+        .join(Course, Course.id == Subject.course_id)
+        .where(Session.id == session_id)
+    )
+    row = r.first()
+    return dict(row._mapping) if row else None
+
+
 async def list_sessions(
     db: AsyncSession,
     classroom_id: Optional[int] = None,
